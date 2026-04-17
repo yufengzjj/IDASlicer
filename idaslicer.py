@@ -85,6 +85,14 @@ class SlicerEntry:
         return self.end - self.start
 
 
+def get_seg_class(seg_type):
+    if seg_type == ida_segment.SEG_CODE:
+        return "CODE"
+    elif seg_type == ida_segment.SEG_BSS:
+        return "BSS"
+    return "DATA"
+
+
 # --- UI Components ---
 
 
@@ -206,6 +214,10 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.save_seg_button.clicked.connect(self.on_save_seg_clicked)
         self.layout.addWidget(self.save_seg_button)
 
+        self.import_seg_button = QtWidgets.QPushButton("Import .seg files")
+        self.import_seg_button.clicked.connect(self.on_import_seg_clicked)
+        self.layout.addWidget(self.import_seg_button)
+
     def on_slice_clicked(self):
         if not ida_domain:
             QtWidgets.QMessageBox.critical(
@@ -226,6 +238,9 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
 
     def on_save_seg_clicked(self):
         self.plugin.save_segments_to_files(self.table.entries)
+
+    def on_import_seg_clicked(self):
+        self.plugin.import_segments_from_files()
 
     def add_entry(self, entry):
         self.table.add_entry(entry)
@@ -390,12 +405,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         # Prepare data for subprocess
         entries_data = []
         for entry in entries:
-            seg_class = "DATA"
-            if entry.seg_type == ida_segment.SEG_CODE:
-                seg_class = "CODE"
-            elif entry.seg_type == ida_segment.SEG_BSS:
-                seg_class = "BSS"
-
+            seg_class = get_seg_class(entry.seg_type)
             content = ida_bytes.get_bytes(entry.start, entry.size())
             entries_data.append(
                 {
@@ -489,8 +499,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 print(f"Failed to read bytes at {hex(entry.start)}")
                 continue
 
-            # Use hex without 0x for filename to be cleaner, or with it if preferred.
-            filename = f"{entry.name}_{hex(entry.start)}_{hex(entry.end)}.seg"
+            # Format: {name}_{start}_{end}_{perm}_{seg_class}.seg
+            filename = f"{entry.name}_{hex(entry.start)}_{hex(entry.end)}_{hex(entry.perm)}_{get_seg_class(entry.seg_type)}.seg"
             # Sanitize filename
             filename = "".join([c for c in filename if c not in '<>:"/\\|?*'])
             file_path = os.path.join(out_dir, filename)
@@ -505,6 +515,121 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         QtWidgets.QMessageBox.information(
             None, "Success", f"Successfully saved {count} segment files to:\n{out_dir}"
         )
+
+    def import_segments_from_files(self):
+        if not ida_domain:
+            QtWidgets.QMessageBox.critical(
+                None,
+                "Error",
+                "IDA Domain API not found. This feature requires IDA Pro 9.1 or later.",
+            )
+            return
+
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            None, "Select .seg files to import", "", "Segment files (*.seg)"
+        )
+        if not files:
+            return
+
+        results = []
+        with ida_domain.Database.open(save_on_close=False) as db:
+            existing_names = [s.name for s in db.segments]
+
+            def get_unique_name(base_name, current_names):
+                if base_name not in current_names:
+                    return base_name
+                counter = 0
+                while f"{base_name}{counter}" in current_names:
+                    counter += 1
+                return f"{base_name}{counter}"
+
+            for file_path in files:
+                filename = os.path.basename(file_path)
+                if not filename.endswith(".seg"):
+                    continue
+
+                # Parse: {name}_{start}_{end}_{perm}_{seg_class}.seg
+                parts = filename[:-4].split("_")
+                if len(parts) < 5:
+                    print(f"Skipping invalid filename: {filename}")
+                    continue
+
+                seg_class = parts[-1]
+                try:
+                    perm = int(parts[-2], 16)
+                    end = int(parts[-3], 16)
+                    start = int(parts[-4], 16)
+                except ValueError:
+                    print(f"Skipping invalid hex values in filename: {filename}")
+                    continue
+
+                name = "_".join(parts[:-4])
+
+                try:
+                    with open(file_path, "rb") as f:
+                        content = f.read()
+                except Exception as e:
+                    print(f"Failed to read {file_path}: {e}")
+                    continue
+
+                if len(content) != (end - start):
+                    print(f"Content size mismatch for {filename}")
+
+                # Find all overlapping segments
+                overlaps = []
+                for s in db.segments:
+                    o_start = max(s.start_ea, start)
+                    o_end = min(s.end_ea, end)
+                    if o_start < o_end:
+                        overlaps.append(s)
+
+                overlaps.sort(key=lambda s: s.start_ea)
+
+                # 1. Overwrite overlapping parts
+                for s in overlaps:
+                    o_start = max(s.start_ea, start)
+                    o_end = min(s.end_ea, end)
+                    offset = o_start - start
+                    chunk = content[offset : offset + (o_end - o_start)]
+                    db.bytes.set_bytes_at(o_start, chunk)
+                    results.append(
+                        f"Overwrote part of '{db.segments.get_name(s)}' at {hex(o_start)}-{hex(o_end)}"
+                    )
+
+                # 2. Create segments for gaps
+                current_pos = start
+                for s in overlaps:
+                    if current_pos < s.start_ea:
+                        unique_name = get_unique_name(name, existing_names)
+                        new_seg = db.segments.add(
+                            0, current_pos, s.start_ea, unique_name, seg_class
+                        )
+                        if new_seg:
+                            db.segments.set_permissions(new_seg, perm)
+                            offset = current_pos - start
+                            chunk = content[offset : offset + (s.start_ea - current_pos)]
+                            db.bytes.set_bytes_at(current_pos, chunk)
+                            results.append(
+                                f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}"
+                            )
+                            existing_names.append(unique_name)
+                    current_pos = max(current_pos, s.end_ea)
+
+                if current_pos < end:
+                    unique_name = get_unique_name(name, existing_names)
+                    new_seg = db.segments.add(0, current_pos, end, unique_name, seg_class)
+                    if new_seg:
+                        db.segments.set_permissions(new_seg, perm)
+                        offset = current_pos - start
+                        chunk = content[offset : offset + (end - current_pos)]
+                        db.bytes.set_bytes_at(current_pos, chunk)
+                        results.append(
+                            f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}"
+                        )
+                        existing_names.append(unique_name)
+
+        summary = "\n".join(results) if results else "No changes made."
+        QtWidgets.QMessageBox.information(None, "Import Summary", summary)
 
 
 class SlicerUIHooks(ida_kernwin.UI_Hooks):
