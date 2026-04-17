@@ -7,7 +7,7 @@
     "idaVersions": ["9.3"],
     "description": "IDASlicer is a productivity plugin for IDA Pro designed to help reverse engineers extract, manage, and `slice` specific parts of a binary (functions, segments, or arbitrary selections) into new IDA databases or raw binary files, especially useful for the analysis of large files.",
     "urls": {
-      "repository": "https://github.com/your-org/your-plugin"
+      "repository": "https://github.com/yufengzjj/IDASlicer.git"
     },
     "authors": [
       {
