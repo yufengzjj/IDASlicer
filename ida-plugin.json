@@ -1,0 +1,24 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "IDASlicer",
+    "version": "0.0.1",
+    "entryPoint": "idaslicer.py",
+    "idaVersions": ["9.3"],
+    "description": "IDASlicer is a productivity plugin for IDA Pro designed to help reverse engineers extract, manage, and `slice` specific parts of a binary (functions, segments, or arbitrary selections) into new IDA databases or raw binary files, especially useful for the analysis of large files.",
+    "urls": {
+      "repository": "https://github.com/your-org/your-plugin"
+    },
+    "authors": [
+      {
+        "name": "yufeng.zjj",
+        "email": "yufeng.zjj@gmail.com"
+      }
+    ],
+    "license": "MIT",
+    "categories": ["api-scripting-and-automation"],
+    "pythonDependencies": ["ida-domain>=0.4.0"],
+    "keywords": ["slice", "extract"],
+    "logoPath": "logo.png"
+  }
+}

@@ -1,0 +1,15 @@
+[project]
+name = "idaslicer"
+version = "0.1.0"
+description = "IDASlicer is a productivity plugin for IDA Pro designed to help reverse engineers extract, manage, and `slice` specific parts of a binary (functions, segments, or arbitrary selections) into new IDA databases or raw binary files, especially useful for the analysis of large files."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ida-domain>=0.4.0",
+]
+
+[dependency-groups]
+dev = [
+    "idapro>=0.0.7",
+    "pyside6>=6.11.0",
+]
