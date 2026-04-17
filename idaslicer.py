@@ -1,3 +1,4 @@
+import json
 import os
 import pickle
 import shutil
@@ -19,8 +20,6 @@ try:
     import ida_domain
 except ImportError:
     ida_domain = None
-
-NETNODE_NAME = "$ IDASlicer_Config"
 
 WORKER_SCRIPT = """
 import sys
@@ -83,6 +82,27 @@ class SlicerEntry:
         self.perm = perm  # rwx
         self.seg_type = seg_type
         self.align = align
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "start": self.start,
+            "end": self.end,
+            "perm": self.perm,
+            "seg_type": self.seg_type,
+            "align": self.align,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        return SlicerEntry(
+            d.get("name", ""),
+            d.get("start", 0),
+            d.get("end", 0),
+            d.get("perm", 0),
+            d.get("seg_type", 0),
+            d.get("align", 0),
+        )
 
     def size(self):
         return self.end - self.start
@@ -329,22 +349,60 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.hooks.hook()
         return ida_idaapi.PLUGIN_KEEP
 
+    def _get_config_path(self):
+        # Store in the same directory as the plugin
+        return os.path.join(
+            os.path.dirname(os.path.realpath(__file__)), "idaslicer_config.json"
+        )
+
     def load_config(self):
-        node = ida_netnode.netnode(NETNODE_NAME, 0, True)
-        data = node.getblob(0, "I")
-        if data:
-            try:
-                config = pickle.loads(data)
-                self.entries = config.get("entries", [])
-                self.last_import_path = config.get("last_import_path", "")
-            except Exception as e:
-                print(f"Failed to load IDASlicer config: {e}")
+        path = self._get_config_path()
+        if not os.path.exists(path):
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+
+            self.last_import_path = config.get("last_import_path", "")
+
+            md5 = ida_nalt.retrieve_input_file_md5()
+            if md5:
+                md5_hex = md5.hex()
+                entries_data = config.get("entries", {}).get(md5_hex, [])
+                self.entries = [SlicerEntry.from_dict(d) for d in entries_data]
+
+            if self.form and hasattr(self.form, "table"):
+                self.form.table.refresh()
+        except Exception as e:
+            print(f"Failed to load IDASlicer config: {e}")
 
     def save_config(self):
-        node = ida_netnode.netnode(NETNODE_NAME, 0, True)
-        config = {"entries": self.entries, "last_import_path": self.last_import_path}
-        data = pickle.dumps(config)
-        node.setblob(data, 0, "I")
+        path = self._get_config_path()
+        config = {"entries": {}, "last_import_path": self.last_import_path}
+
+        # Load existing config to preserve other MD5s
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+            except:
+                pass
+
+        config["last_import_path"] = self.last_import_path
+
+        md5 = ida_nalt.retrieve_input_file_md5()
+        if md5:
+            md5_hex = md5.hex()
+            if "entries" not in config:
+                config["entries"] = {}
+            config["entries"][md5_hex] = [e.to_dict() for e in self.entries]
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4)
+        except Exception as e:
+            print(f"Failed to save IDASlicer config: {e}")
 
     def term(self):
         self.unregister_actions()
@@ -352,9 +410,12 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             self.hooks.unhook()
 
     def run(self, arg):
+        self.load_config()
         if not self.form:
             self.form = SlicerPluginForm(self)
         self.form.Show("Slicer List")
+        if self.form:
+            self.form.table.refresh()
 
     def register_actions(self):
         ida_kernwin.register_action(
