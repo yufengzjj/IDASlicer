@@ -11,6 +11,7 @@ import ida_ida
 import ida_idaapi
 import ida_kernwin
 import ida_nalt
+import ida_netnode
 import ida_segment
 from PySide6 import QtCore, QtWidgets
 
@@ -18,6 +19,8 @@ try:
     import ida_domain
 except ImportError:
     ida_domain = None
+
+NETNODE_NAME = "$ IDASlicer_Config"
 
 WORKER_SCRIPT = """
 import sys
@@ -97,8 +100,9 @@ def get_seg_class(seg_type):
 
 
 class SlicerTable(QtWidgets.QTableWidget):
-    def __init__(self, parent=None):
+    def __init__(self, plugin, parent=None):
         super(SlicerTable, self).__init__(parent)
+        self.plugin = plugin
         self.setColumnCount(4)
         self.setHorizontalHeaderLabels(["Name", "Start", "End", "Attributes"])
         self.setSelectionBehavior(
@@ -106,11 +110,15 @@ class SlicerTable(QtWidgets.QTableWidget):
         )
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
-        self.entries = []
+
+    @property
+    def entries(self):
+        return self.plugin.entries
 
     def add_entry(self, entry):
         self.entries.append(entry)
         self.refresh()
+        self.plugin.save_config()
 
     def refresh(self):
         self.setRowCount(0)
@@ -145,6 +153,7 @@ class SlicerTable(QtWidgets.QTableWidget):
     def delete_entry(self, row):
         self.entries.pop(row)
         self.refresh()
+        self.plugin.save_config()
 
     def edit_entry(self, row):
         entry = self.entries[row]
@@ -183,6 +192,7 @@ class SlicerTable(QtWidgets.QTableWidget):
                 entry.seg_type = int(type_edit.text())
                 entry.align = int(align_edit.text())
                 self.refresh()
+                self.plugin.save_config()
             except ValueError:
                 QtWidgets.QMessageBox.warning(self, "Error", "Invalid input format.")
 
@@ -196,8 +206,9 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.parent = self.FormToPyQtWidget(form)
         self.layout = QtWidgets.QVBoxLayout(self.parent)
 
-        self.table = SlicerTable()
+        self.table = SlicerTable(self.plugin)
         self.layout.addWidget(self.table)
+        self.table.refresh()
 
         type_layout = QtWidgets.QHBoxLayout()
         type_layout.addWidget(QtWidgets.QLabel("File Type:"))
@@ -310,10 +321,30 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
     def init(self):
         self.form = None
+        self.entries = []
+        self.last_import_path = ""
+        self.load_config()
         self.register_actions()
         self.hooks = SlicerUIHooks(self)
         self.hooks.hook()
         return ida_idaapi.PLUGIN_KEEP
+
+    def load_config(self):
+        node = ida_netnode.netnode(NETNODE_NAME, 0, True)
+        data = node.getblob(0, "I")
+        if data:
+            try:
+                config = pickle.loads(data)
+                self.entries = config.get("entries", [])
+                self.last_import_path = config.get("last_import_path", "")
+            except Exception as e:
+                print(f"Failed to load IDASlicer config: {e}")
+
+    def save_config(self):
+        node = ida_netnode.netnode(NETNODE_NAME, 0, True)
+        config = {"entries": self.entries, "last_import_path": self.last_import_path}
+        data = pickle.dumps(config)
+        node.setblob(data, 0, "I")
 
     def term(self):
         self.unregister_actions()
@@ -354,9 +385,10 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         ida_kernwin.unregister_action("idaslicer:add_seg")
 
     def add_to_list(self, entry):
-        if not self.form:
-            self.run(0)
-        self.form.add_entry(entry)
+        self.entries.append(entry)
+        self.save_config()
+        if self.form:
+            self.form.table.refresh()
 
     def detect_file_type(self):
         ftype_enum = ida_ida.inf_get_filetype()
@@ -452,7 +484,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 capture_output=True,
                 text=True,
                 env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if result.returncode == 0:
                 print(f"Slicing complete. Saved to: {out_path}")
@@ -526,12 +558,19 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             return
 
         files, _ = QtWidgets.QFileDialog.getOpenFileNames(
-            None, "Select .seg files to import", "", "Segment files (*.seg)"
+            None,
+            "Select .seg files to import",
+            self.last_import_path,
+            "Segment files (*.seg)",
         )
         if not files:
             return
 
+        self.last_import_path = os.path.dirname(files[0])
+        self.save_config()
+
         results = []
+        overwrite_all = False
         with ida_domain.Database.open(save_on_close=False) as db:
             existing_names = [s.name for s in db.segments]
 
@@ -589,6 +628,31 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 for s in overlaps:
                     o_start = max(s.start_ea, start)
                     o_end = min(s.end_ea, end)
+
+                    if not overwrite_all:
+                        msg_box = QtWidgets.QMessageBox()
+                        msg_box.setWindowTitle("Overwrite Conflict")
+                        msg_box.setText(
+                            f"The segment from '{filename}' overlaps with existing segment '{db.segments.get_name(s)}' at {hex(o_start)}-{hex(o_end)}.\n\nDo you want to overwrite the data?"
+                        )
+                        msg_box.setStandardButtons(
+                            QtWidgets.QMessageBox.StandardButton.Yes
+                            | QtWidgets.QMessageBox.StandardButton.No
+                        )
+                        msg_box.setDefaultButton(
+                            QtWidgets.QMessageBox.StandardButton.No
+                        )
+
+                        cb = QtWidgets.QCheckBox("Apply to all remaining conflicts")
+                        msg_box.setCheckBox(cb)
+
+                        res = msg_box.exec()
+                        if cb.isChecked():
+                            overwrite_all = True
+
+                        if res == QtWidgets.QMessageBox.StandardButton.No:
+                            continue
+
                     offset = o_start - start
                     chunk = content[offset : offset + (o_end - o_start)]
                     db.bytes.set_bytes_at(o_start, chunk)
@@ -607,7 +671,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                         if new_seg:
                             db.segments.set_permissions(new_seg, perm)
                             offset = current_pos - start
-                            chunk = content[offset : offset + (s.start_ea - current_pos)]
+                            chunk = content[
+                                offset : offset + (s.start_ea - current_pos)
+                            ]
                             db.bytes.set_bytes_at(current_pos, chunk)
                             results.append(
                                 f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}"
@@ -617,7 +683,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
                 if current_pos < end:
                     unique_name = get_unique_name(name, existing_names)
-                    new_seg = db.segments.add(0, current_pos, end, unique_name, seg_class)
+                    new_seg = db.segments.add(
+                        0, current_pos, end, unique_name, seg_class
+                    )
                     if new_seg:
                         db.segments.set_permissions(new_seg, perm)
                         offset = current_pos - start
