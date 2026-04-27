@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import pickle
@@ -12,7 +13,6 @@ import ida_ida
 import ida_idaapi
 import ida_kernwin
 import ida_nalt
-import ida_netnode
 import ida_segment
 from PySide6 import QtCore, QtWidgets
 
@@ -75,13 +75,27 @@ if __name__ == "__main__":
 
 
 class SlicerEntry:
-    def __init__(self, name, start, end, perm, seg_type, align):
+    def __init__(self, name, start, end, perm, seg_type, align, sig=""):
         self.name = name
         self.start = start
         self.end = end
         self.perm = perm  # rwx
         self.seg_type = seg_type
         self.align = align
+        self.sig = sig
+        if not self.sig:
+            self.update_sig()
+
+    def update_sig(self):
+        size = self.end - self.start
+        if size > 0:
+            content = ida_bytes.get_bytes(self.start, size)
+            if content:
+                self.sig = hashlib.md5(content).hexdigest()
+            else:
+                self.sig = "error"
+        else:
+            self.sig = ""
 
     def to_dict(self):
         return {
@@ -91,6 +105,7 @@ class SlicerEntry:
             "perm": self.perm,
             "seg_type": self.seg_type,
             "align": self.align,
+            "sig": self.sig,
         }
 
     @staticmethod
@@ -102,6 +117,7 @@ class SlicerEntry:
             d.get("perm", 0),
             d.get("seg_type", 0),
             d.get("align", 0),
+            d.get("sig", ""),
         )
 
     def size(self):
@@ -123,10 +139,13 @@ class SlicerTable(QtWidgets.QTableWidget):
     def __init__(self, plugin, parent=None):
         super(SlicerTable, self).__init__(parent)
         self.plugin = plugin
-        self.setColumnCount(4)
-        self.setHorizontalHeaderLabels(["Name", "Start", "End", "Attributes"])
+        self.setColumnCount(5)
+        self.setHorizontalHeaderLabels(["Name", "Start", "End", "Attributes", "Sig"])
         self.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
         )
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
@@ -154,26 +173,41 @@ class SlicerTable(QtWidgets.QTableWidget):
             perm_str += "X" if entry.perm & ida_segment.SEGPERM_EXEC else "."
             attr_str = f"{perm_str} | T:{entry.seg_type} | A:{entry.align}"
             self.setItem(i, 3, QtWidgets.QTableWidgetItem(attr_str))
+            self.setItem(i, 4, QtWidgets.QTableWidgetItem(entry.sig))
 
     def show_context_menu(self, pos):
-        row = self.currentRow()
-        if row < 0:
+        selected_rows = [index.row() for index in self.selectionModel().selectedRows()]
+        if not selected_rows:
             return
 
         menu = QtWidgets.QMenu()
-        edit_action = menu.addAction("Edit")
+        edit_action = None
+        if len(selected_rows) == 1:
+            edit_action = menu.addAction("Edit")
         delete_action = menu.addAction("Delete")
 
         action = menu.exec(self.mapToGlobal(pos))
-        if action == edit_action:
-            self.edit_entry(row)
+        if edit_action and action == edit_action:
+            self.edit_entry(selected_rows[0])
         elif action == delete_action:
-            self.delete_entry(row)
+            self.delete_entries(selected_rows)
 
-    def delete_entry(self, row):
-        self.entries.pop(row)
+    def delete_entries(self, rows):
+        # Sort rows in reverse order to pop from the end to keep indices valid
+        for row in sorted(rows, reverse=True):
+            self.entries.pop(row)
         self.refresh()
         self.plugin.save_config()
+
+    def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key.Key_Delete:
+            selected_rows = [
+                index.row() for index in self.selectionModel().selectedRows()
+            ]
+            if selected_rows:
+                self.delete_entries(selected_rows)
+        else:
+            super(SlicerTable, self).keyPressEvent(event)
 
     def edit_entry(self, row):
         entry = self.entries[row]
@@ -211,6 +245,7 @@ class SlicerTable(QtWidgets.QTableWidget):
                 entry.perm = int(perm_edit.text())
                 entry.seg_type = int(type_edit.text())
                 entry.align = int(align_edit.text())
+                entry.update_sig()
                 self.refresh()
                 self.plugin.save_config()
             except ValueError:
@@ -302,10 +337,17 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
                 return 0
             start, end = seg.start_ea, seg.end_ea
         else:
+            # Try to get selection
             success, start, end = ida_kernwin.read_range_selection(ctx.widget)
             if not success:
-                print("No selection range.")
-                return 0
+                # No selection, use current address
+                start = ctx.cur_ea
+                # Get the size of the item at current address (instruction or data)
+                item_size = ida_bytes.get_item_size(start)
+                end = start + item_size
+                print(
+                    f"No selection, adding current item at {hex(start)} (size {item_size})"
+                )
 
         seg = ida_segment.getseg(start)
         if not seg:
@@ -592,8 +634,11 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 print(f"Failed to read bytes at {hex(entry.start)}")
                 continue
 
-            # Format: {name}_{start}_{end}_{perm}_{seg_class}.seg
-            filename = f"{entry.name}_{hex(entry.start)}_{hex(entry.end)}_{hex(entry.perm)}_{get_seg_class(entry.seg_type)}.seg"
+            # Update sig to reflect current memory state
+            entry.update_sig()
+
+            # Format: {name}_{start}_{end}_{perm}_{seg_class}_{sig}.seg
+            filename = f"{entry.name}_{hex(entry.start)}_{hex(entry.end)}_{hex(entry.perm)}_{get_seg_class(entry.seg_type)}_{entry.sig}.seg"
             # Sanitize filename
             filename = "".join([c for c in filename if c not in '<>:"/\\|?*'])
             file_path = os.path.join(out_dir, filename)
@@ -648,22 +693,23 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 if not filename.endswith(".seg"):
                     continue
 
-                # Parse: {name}_{start}_{end}_{perm}_{seg_class}.seg
+                # Parse: {name}_{start}_{end}_{perm}_{seg_class}_{sig}.seg
                 parts = filename[:-4].split("_")
-                if len(parts) < 5:
-                    print(f"Skipping invalid filename: {filename}")
+                if len(parts) < 6:
+                    print(f"Skipping invalid filename (too few parts): {filename}")
                     continue
 
-                seg_class = parts[-1]
+                expected_sig = parts[-1]
+                seg_class = parts[-2]
                 try:
-                    perm = int(parts[-2], 16)
-                    end = int(parts[-3], 16)
-                    start = int(parts[-4], 16)
+                    perm = int(parts[-3], 16)
+                    end = int(parts[-4], 16)
+                    start = int(parts[-5], 16)
                 except ValueError:
                     print(f"Skipping invalid hex values in filename: {filename}")
                     continue
 
-                name = "_".join(parts[:-4])
+                name = "_".join(parts[:-5])
 
                 try:
                     with open(file_path, "rb") as f:
@@ -671,6 +717,21 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 except Exception as e:
                     print(f"Failed to read {file_path}: {e}")
                     continue
+
+                # MD5 Validation
+                actual_sig = hashlib.md5(content).hexdigest()
+                if actual_sig != expected_sig:
+                    msg = f"MD5 mismatch for {filename}!\n\nExpected: {expected_sig}\nActual: {actual_sig}\n\nDo you want to skip this file?"
+                    res = QtWidgets.QMessageBox.question(
+                        None,
+                        "Validation Error",
+                        msg,
+                        QtWidgets.QMessageBox.StandardButton.Yes
+                        | QtWidgets.QMessageBox.StandardButton.No,
+                        QtWidgets.QMessageBox.StandardButton.Yes,
+                    )
+                    if res == QtWidgets.QMessageBox.StandardButton.Yes:
+                        continue
 
                 if len(content) != (end - start):
                     print(f"Content size mismatch for {filename}")
