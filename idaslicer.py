@@ -371,8 +371,22 @@ def check_d_ref_range(
         ea = next_ea
 
 
+def is_stub_func(func) -> bool:
+    """A library function or a named import thunk: not exported in full, only
+    its first instruction is collected (see `_collect_stub_range`) so that
+    references to it resolve to a name instead of an unknown address."""
+    if func.flags & ida_funcs.FUNC_LIB:
+        return True
+    if func.flags & ida_funcs.FUNC_THUNK:
+        if ida_bytes.has_name(ida_bytes.get_flags(func.start_ea)):
+            return True
+    return False
+
+
 def get_recursive_functions(start_ea, initial=True) -> list:
-    """Get all functions called by start_ea recursively, excluding library functions"""
+    """Get all functions reachable from start_ea. Library functions and named
+    import thunks are included in the result but NOT recursed into; only their
+    first instruction is later collected so references to them show the name."""
     to_export = list()
     stack = [start_ea]
 
@@ -386,17 +400,12 @@ def get_recursive_functions(start_ea, initial=True) -> list:
         if func_ea in to_export:
             continue
 
-        # Don't export library functions and don't recurse into them
-        if func.flags & ida_funcs.FUNC_LIB:
+        to_export.append(func_ea)
+
+        # Don't recurse into library functions / import stubs.
+        if is_stub_func(func):
             continue
 
-        # Skip import stubs (thunks with a non-default name)
-        if func.flags & ida_funcs.FUNC_THUNK:
-            flags = ida_bytes.get_flags(func_ea)
-            if ida_bytes.has_name(flags):
-                continue
-
-        to_export.append(func_ea)
         # Find all calls from this function
         for head in idautils.FuncItems(func_ea):
             for ref in idautils.CodeRefsFrom(head, False):
@@ -463,9 +472,24 @@ def _scan_func_ranges(func, collected: list, funcs_to_export: list, processed_ra
     _scan_worklist(all_ranges, func, collected, funcs_to_export, processed_ranges)
 
 
+def _collect_stub_range(func, collected: list, processed_ranges: set):
+    """Collect only the first instruction of a library/thunk function, so that
+    references to it resolve to its name without pulling in the whole function
+    or recursing into it."""
+    start = func.start_ea
+    end = ida_bytes.get_item_end(start)
+    if end <= start:
+        return
+    if (start, end) in processed_ranges:
+        return
+    collected.append((start, end))
+    processed_ranges.add((start, end))
+
+
 def _drain_functions(funcs_to_export: list, collected: list, processed_ranges: set):
     """Process every function on the worklist (which grows as references are
-    discovered) through `_scan_func_ranges`."""
+    discovered). Regular functions are scanned in full; library functions and
+    named import thunks contribute only their first instruction."""
     processed_funcs = set()
     while len(funcs_to_export) > 0:
         if ida_kernwin.user_cancelled():
@@ -477,7 +501,10 @@ def _drain_functions(funcs_to_export: list, collected: list, processed_ranges: s
         if func is None or func.start_ea != ea:
             continue
         processed_funcs.add(func.start_ea)
-        _scan_func_ranges(func, collected, funcs_to_export, processed_ranges)
+        if is_stub_func(func):
+            _collect_stub_range(func, collected, processed_ranges)
+        else:
+            _scan_func_ranges(func, collected, funcs_to_export, processed_ranges)
 
 
 def collect_recursive_ranges(start_ea) -> list:
