@@ -1,69 +1,34 @@
 # IDASlicer
 
-IDASlicer is a productivity plugin for IDA Pro designed to help reverse engineers extract, manage, and "slice" specific parts of a binary (functions, segments, or arbitrary selections) into new IDA databases or raw binary files, especially useful for the analysis of large files.
+IDASlicer extracts and "slices" parts of a binary — functions, segments, or selections — into new IDA databases or `.seg` files. Handy for carving a manageable piece out of a large binary.
 
 [中文版](./README_zh.md)
 
 ## Features
 
-- **Multi-Source Slicing**: Add entries to your slice list directly from the disassembly view via right-click context menus:
-  - **Add function to slicer**: Automatically detects the current function boundaries.
-  - **Add selection to slicer**: Uses your current manual highlight/selection.
-  - **Add current segment to slicer**: Grabs the entire segment containing the cursor.
-- **Slicer Management**: A dedicated UI panel to review, edit (name, range, permissions, etc.), or delete entries before processing.
-- **Persistence**: 
-  - **Per-Binary List**: Your slicer list is automatically saved and loaded based on the MD5 of the binary you are analyzing.
-  - **Path Memory**: Remembers the last directory used for importing `.seg` files.
-- **Database Slicing (IDA 9.1+)**:
-  - Creates a brand-new IDA database (`.i64`) containing only the selected slices.
-  - Automatically detects file types (ELF, PE, Mach-O) and architectures (x86, x64, ARM, ARM64) to use appropriate templates.
-  - Uses the IDA Domain API for headless database generation.
-- **Raw Binary Export**:
-  - Export all slices as individual raw binary files.
-  - Filenames are automatically formatted as `Name_StartAddr_EndAddr.seg`.
-- **Segment Import (IDA 9.1+)**: 
-  - Import previously exported `.seg` files into an existing database.
-  - Smart handling of overlaps: choose to overwrite existing data or create new segments for gaps.
+- **Add to slicer** (right-click in the disassembly → `Add to Slicer/`):
+  - **Function**, **Selection**, or **Current segment**.
+  - **Function recursively** — adds the function plus every code/data range it references, followed transitively. Referenced library functions and import thunks contribute just their first instruction, so calls to them resolve to a name instead of an unknown address.
+- **Slicer panel** (`Edit → Plugins → IDASlicer`): review, edit (name, range, permissions, type, align), or delete entries; the Size column shows each range's length. Editing a recursive entry's range re-scans it for new references. The list is saved per-binary (keyed by input MD5) in `idaslicer_config.json`.
+- **Create IDA database (9.1+)**: builds a new `.i64` containing only the slices, auto-selecting a template by file type (ELF/PE/Mach-O) and architecture (x86/x64/ARM/ARM64).
+- **Export `.seg` files**: each entry is saved with its segment name, range, permissions, type/align, bytes, and user-defined symbol names. Optionally **merge** all ranges into a single file for easy transport.
+- **Import `.seg` files (9.1+)**: load single or merged files back into a database, restoring bytes, segment attributes, and symbol names. Overlaps with existing segments are resolved by overwriting or by creating new segments for gaps.
 
 ## Requirements
 
-- **IDA Pro 9.1+**: Required for the "Slice and Create IDA Database" and "Import .seg files" features (requires `ida_domain` API).
-- **Python 3**: The plugin runs on the Python environment integrated with IDA.
-- **PySide6**: Included with modern IDA Pro installations.
+- **IDA Pro 9.1+** for the database create/import features (uses the `ida_domain` API). The other features work on earlier 9.x.
+- **PySide6** (bundled with modern IDA Pro).
 
 ## Installation
 
-Copy entire folder into your IDA plugins directory:
-   - **Windows**: `%AppData%\Hex-Rays\IDA Pro\plugins`
-   - **Linux/macOS**: `~/.idapro/plugins`
+Copy the whole folder into your IDA plugins directory:
+- **Windows**: `%AppData%\Hex-Rays\IDA Pro\plugins`
+- **Linux/macOS**: `~/.idapro/plugins`
 
-## Usage
+## How it works
 
-1. **Populate the List**:
-   - Right-click in the **IDA View (Disassembly)**.
-   - Navigate to `Add to Slicer /`.
-   - Choose to add a function, selection, or the entire segment.
-2. **Open the Plugin**:
-   - Go to `Edit -> Plugins -> IDASlicer`.
-3. **Review and Edit**:
-   - Double-click an entry in the table to modify its properties.
-   - Right-click an entry to delete it.
-   - The list is automatically saved to `idaslicer_config.json`.
-4. **Export / Import**:
-   - **Slice and Create IDA Database**: Generates a new `.i64` file with the segments recreated and data populated.
-   - **Save segments to .seg files**: Dumps the raw bytes of each entry into `.seg` files.
-   - **Import .seg files**: Load `.seg` files back into the database, with conflict resolution for overlapping segments.
-
-## How it Works
-
-### Database Slicing
-The plugin uses a template-based approach. It copies a "mini" database from the `obj_minis` directory and then runs a background Python process using IDA's `ida_domain` API to inject the selected segments and their content into the new database without closing your current session.
-
-### Raw Export
-It utilizes `ida_bytes.get_bytes` to read the database content and writes it directly to disk, ensuring that any manual patches or re-analyzed data in your current IDB are preserved in the export.
-
-### Segment Import
-Uses the `ida_domain` API to modify segments and bytes. It parses metadata from the `.seg` filename, detects overlaps with existing segments, and provides options to overwrite data or fill gaps by creating new segments.
+- **Database slicing** copies a mini template from `obj_minis/` and runs a background process via the `ida_domain` API to recreate the segments, bytes, attributes, and names — without closing your current session.
+- **`.seg` files** are pickled dicts holding the metadata, bytes, and collected symbol names, so nothing depends on fragile filename parsing. Import auto-detects single vs. merged files and reapplies everything (names via `ida_name`, type/align on the created segment), with overlap conflict resolution.
 
 ## License
 [MIT](LICENSE)
