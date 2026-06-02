@@ -36,6 +36,7 @@ def run_worker(data_path):
     try:
         import ida_domain
         import ida_segment
+        import ida_name
     except ImportError:
         print(traceback.format_exc())
         sys.exit(1)
@@ -68,12 +69,16 @@ def run_worker(data_path):
                     seg_obj = ida_segment.getseg(entry_data['start'])
                     if seg_obj is not None:
                         if seg_type is not None:
-                            ida_segment.set_segm_type(entry_data['start'], seg_type)
+                            seg_obj.type = seg_type
                         if align is not None:
                             seg_obj.align = align
                         seg_obj.update()
                 if entry_data['content']:
                     db.bytes.set_bytes_at(entry_data['start'], entry_data['content'])
+                for off, nm in entry_data.get('names', []):
+                    ida_name.set_name(
+                        entry_data['start'] + off, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK
+                    )
 
             # Database is saved when db.__exit__ is called
             print("Successfully processed segments.")
@@ -897,7 +902,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         if not s:
             return
         if seg_type is not None:
-            ida_segment.set_segm_type(seg_start, seg_type)
+            s.type = seg_type
         if align is not None:
             s.align = align
         s.update()
@@ -1060,6 +1065,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     "seg_type": entry.seg_type,
                     "align": entry.align,
                     "seg_class": seg_class,
+                    "names": self._collect_names(entry.start, entry.end),
                     "content": content,
                 }
             )
@@ -1117,6 +1123,23 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 os.remove(script_path)
 
     @staticmethod
+    def _collect_names(start, end):
+        """Collect user-defined names at every address in [start, end), as a
+        list of [offset_from_start, name]. Walks item by item (so named
+        undefined bytes are caught too) and skips auto-generated dummy names
+        (sub_, loc_, byte_, ...), which IDA regenerates and would only bloat the
+        payload."""
+        names = []
+        ea = start
+        while ea < end:
+            nm = ida_name.get_name(ea)
+            if nm:
+                names.append([ea - start, nm])
+            nxt = ida_bytes.get_item_end(ea)
+            ea = nxt if nxt > ea else ea + 1
+        return names
+
+    @staticmethod
     def _build_payload(entry):
         """Build the pickled payload dict for one entry, or None if its bytes
         can't be read."""
@@ -1138,6 +1161,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             "align": entry.align,
             "seg_class": get_seg_class(entry.seg_type),
             "sig": entry.sig,
+            "names": IDASlicerPlugin._collect_names(entry.start, entry.end),
             "content": content,
         }
 
@@ -1342,6 +1366,12 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                         db.bytes.set_bytes_at(current_pos, chunk)
                         results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}")
                         existing_names.append(unique_name)
+
+                # 3. Restore names collected from the source database.
+                for off, nm in payload.get("names", []):
+                    ida_name.set_name(
+                        start + off, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK
+                    )
 
             for file_path in files:
                 filename = os.path.basename(file_path)
