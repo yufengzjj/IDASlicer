@@ -13,3 +13,6 @@ dev = [
     "idapro>=0.0.7",
     "pyside6>=6.11.0",
 ]
+
+[tool.ruff]
+line-length = 150

@@ -13,7 +13,12 @@ import ida_ida
 import ida_idaapi
 import ida_kernwin
 import ida_nalt
+import ida_name
+import ida_range
 import ida_segment
+import ida_ua
+import idaapi
+import idautils
 from PySide6 import QtCore, QtWidgets
 
 try:
@@ -30,6 +35,7 @@ import traceback
 def run_worker(data_path):
     try:
         import ida_domain
+        import ida_segment
     except ImportError:
         print(traceback.format_exc())
         sys.exit(1)
@@ -56,6 +62,16 @@ def run_worker(data_path):
                     print(f"Failed to add segment: {unique_name}")
                     continue
                 db.segments.set_permissions(seg, entry_data['perm'])
+                seg_type = entry_data.get('seg_type')
+                align = entry_data.get('align')
+                if seg_type is not None or align is not None:
+                    seg_obj = ida_segment.getseg(entry_data['start'])
+                    if seg_obj is not None:
+                        if seg_type is not None:
+                            ida_segment.set_segm_type(entry_data['start'], seg_type)
+                        if align is not None:
+                            seg_obj.align = align
+                        seg_obj.update()
                 if entry_data['content']:
                     db.bytes.set_bytes_at(entry_data['start'], entry_data['content'])
 
@@ -75,13 +91,16 @@ if __name__ == "__main__":
 
 
 class SlicerEntry:
-    def __init__(self, name, start, end, perm, seg_type, align, sig=""):
+    def __init__(self, name, start, end, perm, seg_type, align, sig="", recursive=False):
         self.name = name
         self.start = start
         self.end = end
         self.perm = perm  # rwx
         self.seg_type = seg_type
         self.align = align
+        # True if this range was discovered by a recursive reference scan. Such
+        # entries are re-scanned when their range is edited.
+        self.recursive = recursive
         self.sig = sig
         if not self.sig:
             self.update_sig()
@@ -106,6 +125,7 @@ class SlicerEntry:
             "seg_type": self.seg_type,
             "align": self.align,
             "sig": self.sig,
+            "recursive": self.recursive,
         }
 
     @staticmethod
@@ -118,6 +138,7 @@ class SlicerEntry:
             d.get("seg_type", 0),
             d.get("align", 0),
             d.get("sig", ""),
+            d.get("recursive", False),
         )
 
     def size(self):
@@ -132,6 +153,361 @@ def get_seg_class(seg_type):
     return "DATA"
 
 
+# Schema version for the pickled .seg payload (a plain dict). Bump when the
+# field set changes incompatibly.
+SEG_FILE_VERSION = 1
+
+
+def _truncate_filename_name(name, suffix, max_bytes=255):
+    """Truncate only the variable `name` portion so that `name + suffix` fits
+    within `max_bytes` (UTF-8), keeping the metadata `suffix` intact so the
+    filename remains parseable on import."""
+    budget = max_bytes - len(suffix.encode("utf-8"))
+    if budget <= 0:
+        return ""
+    encoded = name.encode("utf-8")
+    if len(encoded) <= budget:
+        return name
+    # 'ignore' drops any trailing incomplete multi-byte sequence
+    return encoded[:budget].decode("utf-8", errors="ignore")
+
+
+# --- Reference Range Scanning ---
+# The code/data range detection helpers below (get_loose_code_block_range,
+# get_loose_data_range, check_func_range, check_c_ref_range, get_ref_from_insn,
+# check_o_ref_range, check_d_ref_range) are taken from the Assemport plugin
+# (AssemportEx/Assemport.py), where they have been correctness-tested.
+
+
+def get_loose_code_block_range(ea):
+    end_ea = ea
+    while True:
+        curr_flags = ida_bytes.get_flags(end_ea)
+        if end_ea == idaapi.BADADDR or not ida_bytes.is_code(curr_flags):
+            break
+        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, True)]
+        if len(refs) == 0:
+            end_ea = ida_bytes.get_item_end(end_ea)
+            break
+        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, False)]
+        if len(refs) > 0:
+            end_ea = ida_bytes.get_item_end(end_ea)
+            break
+        cur_func = ida_funcs.get_func(end_ea)
+        if cur_func:
+            if cur_func.start_ea <= end_ea < cur_func.end_ea:
+                end_ea = cur_func.end_ea
+                break
+            if cur_func.start_ea == end_ea:
+                break
+        cur_fchunk = ida_funcs.get_fchunk(end_ea)
+        if cur_fchunk:
+            if cur_fchunk.start_ea <= end_ea < cur_fchunk.end_ea:
+                end_ea = cur_fchunk.end_ea
+                break
+            if cur_fchunk.start_ea == end_ea:
+                break
+        end_ea = ida_bytes.get_item_end(end_ea)
+    return ida_range.range_t(ea, end_ea)
+
+
+def get_loose_data_range(ea, max_explore_len=0):
+    end_ea = ea
+    while True:
+        if end_ea == idaapi.BADADDR or not ida_bytes.is_mapped(end_ea):
+            break
+        name = ida_name.get_name(end_ea)
+        if end_ea != ea and name:
+            break
+        next_ea = ida_bytes.get_item_end(end_ea)
+        if next_ea <= end_ea or next_ea == idaapi.BADADDR:
+            break
+        end_ea = next_ea
+        if max_explore_len <= 0 or end_ea - ea >= max_explore_len:
+            break
+    return ida_range.range_t(ea, end_ea)
+
+
+def check_func_range(
+    ranges: list,
+    ref: int,
+    cur_func: ida_funcs.func_t,
+    funcs_to_export: list | None,
+    processed_ranges: set,
+):
+    """check the possible func range(or just a commom code chunk)"""
+    func = ida_funcs.get_func(ref)
+    if func and func.start_ea != cur_func.start_ea:
+        if ref == func.start_ea:
+            if funcs_to_export is not None:
+                funcs_to_export.extend(get_recursive_functions(func.start_ea, False))
+        else:
+            if func.start_ea <= ref < func.end_ea:
+                r = ida_range.range_t(ref, func.end_ea)
+                if (ref, func.end_ea) not in processed_ranges and r not in ranges:
+                    ranges.append(r)
+            else:
+                r = get_loose_code_block_range(ref)
+                if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                    ranges.append(r)
+    elif not func:
+        r = get_loose_code_block_range(ref)
+        if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+            ranges.append(r)
+
+
+def check_c_ref_range(
+    ranges: list,
+    addr: int,
+    cur_range: tuple[int, int],
+    cur_func: ida_funcs.func_t,
+    funcs_to_export: list | None,
+    processed_ranges: set,
+):
+    """check code ref at addr"""
+    for ref in idautils.CodeRefsFrom(addr, False):
+        if cur_range[0] <= ref < cur_range[1]:
+            continue
+        check_func_range(ranges, ref, cur_func, funcs_to_export, processed_ranges)
+
+
+def get_ref_from_insn(ea):
+    insn = ida_ua.insn_t()  # ty:ignore[missing-argument]
+    if ida_ua.decode_insn(insn, ea) == 0:
+        return None
+
+    mn = insn.get_canon_mnem()
+    if mn not in ("ADR", "ADRL", "ADRP", "LDR"):
+        return None
+    if mn in ("ADRP", "LDR"):
+        for xref in idautils.XrefsFrom(ea, idaapi.XREF_DATA):
+            return xref.to
+    for op in insn.ops:
+        if op.type in (idaapi.o_mem, idaapi.o_imm, idaapi.o_far, idaapi.o_near):
+            if op.addr != 0 and op.addr != idaapi.BADADDR:
+                return op.addr
+            if op.value != 0 and op.value != idaapi.BADADDR:
+                return op.value
+    return None
+
+
+def check_o_ref_range(
+    ranges: list,
+    cur_range: tuple[int, int],
+    cur_func: ida_funcs.func_t,
+    funcs_to_export: list | None,
+    processed_ranges: set,
+    skip_named_data: bool = False,
+    max_explore_len: int = 0,
+):
+    """check code opraand ref in cur_range"""
+    for head in idautils.Heads(*cur_range):
+        o_ref = get_ref_from_insn(head)
+        if o_ref is None:
+            continue
+        if cur_range[0] <= o_ref < cur_range[1]:
+            continue
+        if o_ref == idaapi.BADADDR or not ida_bytes.is_mapped(o_ref):
+            continue
+        o_flags = ida_bytes.get_flags(o_ref)
+        if ida_bytes.is_code(o_flags):
+            check_func_range(ranges, o_ref, cur_func, funcs_to_export, processed_ranges)
+        elif ida_bytes.is_data(o_flags):
+            if skip_named_data and ida_bytes.has_name(o_flags):
+                continue
+            r = ida_range.range_t(o_ref, o_ref + ida_bytes.get_item_size(o_ref))
+            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                ranges.append(r)
+        else:
+            if skip_named_data and ida_bytes.has_name(o_flags):
+                continue
+            r = get_loose_data_range(o_ref, max_explore_len)
+            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+                ranges.append(r)
+
+
+def check_d_ref_range(
+    ranges: list,
+    cur_range: tuple[int, int],
+    cur_func: ida_funcs.func_t,
+    funcs_to_export: list | None,
+    processed_ranges: set,
+    skip_named_data: bool = False,
+    max_explore_len: int = 0,
+):
+    """check data ref"""
+    ea = cur_range[0]
+    ptr_size = ida_ida.inf_get_app_bitness() // 8
+    while ea < cur_range[1]:
+        next_ea = ida_bytes.get_item_end(ea)
+        if next_ea <= ea or next_ea == idaapi.BADADDR:
+            break
+        if ida_bytes.get_item_size(ea) == ptr_size:
+            data = ida_bytes.get_bytes(ea, ptr_size)
+            if data is not None and len(data) == ptr_size:
+                ptr = int.from_bytes(data, "big" if ida_ida.inf_is_be() else "little")
+                if (
+                    not (cur_range[0] <= ptr < cur_range[1])
+                    and ptr != 0
+                    and ptr != idaapi.BADADDR
+                    and ida_bytes.is_mapped(ptr)
+                    and ida_segment.segtype(ptr) != ida_segment.SEG_XTRN
+                ):
+                    flags = ida_bytes.get_flags(ptr)
+                    if ida_bytes.is_code(flags):
+                        check_func_range(ranges, ptr, cur_func, funcs_to_export, processed_ranges)
+                    elif not (skip_named_data and ida_bytes.has_name(flags)):
+                        r = get_loose_data_range(ptr, max_explore_len)
+                        if (
+                            r.start_ea,
+                            r.end_ea,
+                        ) not in processed_ranges and r not in ranges:
+                            ranges.append(r)
+        ea = next_ea
+
+
+def get_recursive_functions(start_ea, initial=True) -> list:
+    """Get all functions called by start_ea recursively, excluding library functions"""
+    to_export = list()
+    stack = [start_ea]
+
+    while stack:
+        ea = stack.pop(0)
+        func = ida_funcs.get_func(ea)
+        if not func:
+            continue
+
+        func_ea = func.start_ea
+        if func_ea in to_export:
+            continue
+
+        # Don't export library functions and don't recurse into them
+        if func.flags & ida_funcs.FUNC_LIB:
+            continue
+
+        # Skip import stubs (thunks with a non-default name)
+        if func.flags & ida_funcs.FUNC_THUNK:
+            flags = ida_bytes.get_flags(func_ea)
+            if ida_bytes.has_name(flags):
+                continue
+
+        to_export.append(func_ea)
+        # Find all calls from this function
+        for head in idautils.FuncItems(func_ea):
+            for ref in idautils.CodeRefsFrom(head, False):
+                called_func = ida_funcs.get_func(ref)
+                if called_func and called_func.start_ea != func_ea:
+                    stack.append(called_func.start_ea)
+
+    return to_export
+
+
+class _NoFunc:
+    """Sentinel passed as `cur_func` when scanning a range that is not inside a
+    function. Only `.start_ea` is read by the check_* helpers; BADADDR never
+    matches a real function start, so nothing is wrongly skipped."""
+
+    start_ea = idaapi.BADADDR
+    end_ea = idaapi.BADADDR
+
+
+_NO_FUNC = _NoFunc()
+
+
+def _scan_worklist(
+    all_ranges: list,
+    cur_func,
+    collected: list,
+    funcs_to_export: list,
+    processed_ranges: set,
+):
+    """Drain a worklist of ranges, recording each into `collected` and appending
+    newly discovered code/data ranges (back onto `all_ranges`) and referenced
+    functions (onto `funcs_to_export`). `cur_func` is the function the seed
+    ranges belong to (or `_NO_FUNC` for loose ranges)."""
+    while len(all_ranges) > 0:
+        r = all_ranges.pop(0)
+        start, end = r.start_ea, r.end_ea
+        if start >= end:
+            continue
+        if (start, end) in processed_ranges:
+            continue
+
+        collected.append((start, end))
+
+        flags = ida_bytes.get_flags(start)
+        if ida_bytes.is_code(flags):
+            if start >= cur_func.start_ea and end <= cur_func.end_ea:
+                check_c_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), cur_func, funcs_to_export, processed_ranges)
+            else:
+                for head in idautils.Heads(start, end):
+                    check_c_ref_range(all_ranges, head, (start, end), cur_func, funcs_to_export, processed_ranges)
+            check_o_ref_range(all_ranges, (start, end), cur_func, funcs_to_export, processed_ranges)
+        else:
+            check_d_ref_range(all_ranges, (start, end), cur_func, funcs_to_export, processed_ranges)
+
+        processed_ranges.add((start, end))
+
+
+def _scan_func_ranges(func, collected: list, funcs_to_export: list, processed_ranges: set):
+    """Scan a single function's ranges via the shared worklist driver."""
+    ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
+    ida_funcs.get_func_ranges(ranges, func)
+    all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
+    all_ranges.sort(key=lambda r: (0 if r.start_ea == func.start_ea else 1, r.start_ea))
+    _scan_worklist(all_ranges, func, collected, funcs_to_export, processed_ranges)
+
+
+def _drain_functions(funcs_to_export: list, collected: list, processed_ranges: set):
+    """Process every function on the worklist (which grows as references are
+    discovered) through `_scan_func_ranges`."""
+    processed_funcs = set()
+    while len(funcs_to_export) > 0:
+        if ida_kernwin.user_cancelled():
+            break
+        ea = funcs_to_export.pop(0)
+        if ea in processed_funcs:
+            continue
+        func = ida_funcs.get_func(ea)
+        if func is None or func.start_ea != ea:
+            continue
+        processed_funcs.add(func.start_ea)
+        _scan_func_ranges(func, collected, funcs_to_export, processed_ranges)
+
+
+def collect_recursive_ranges(start_ea) -> list:
+    """Collect the range of the function at `start_ea` plus all code/data ranges
+    it references, recursively following the discovered functions/ranges.
+
+    Returns a list of (start_ea, end_ea) tuples."""
+    funcs_to_export = get_recursive_functions(start_ea)
+    processed_ranges = set()
+    collected = []
+    _drain_functions(funcs_to_export, collected, processed_ranges)
+    return collected
+
+
+def collect_recursive_ranges_from_range(start, end) -> list:
+    """Like `collect_recursive_ranges`, but seeded from an arbitrary range
+    instead of a function. Used when an existing range is edited: the new range
+    is scanned for references and everything reachable is collected.
+
+    The seed range itself is included in the result."""
+    processed_ranges = set()
+    funcs_to_export = []
+    collected = []
+    cur_func = ida_funcs.get_func(start) or _NO_FUNC
+    _scan_worklist(
+        [ida_range.range_t(start, end)],
+        cur_func,
+        collected,
+        funcs_to_export,
+        processed_ranges,
+    )
+    _drain_functions(funcs_to_export, collected, processed_ranges)
+    return collected
+
+
 # --- UI Components ---
 
 
@@ -139,14 +515,10 @@ class SlicerTable(QtWidgets.QTableWidget):
     def __init__(self, plugin, parent=None):
         super(SlicerTable, self).__init__(parent)
         self.plugin = plugin
-        self.setColumnCount(5)
-        self.setHorizontalHeaderLabels(["Name", "Start", "End", "Attributes", "Sig"])
-        self.setSelectionBehavior(
-            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
-        )
-        self.setSelectionMode(
-            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
-        )
+        self.setColumnCount(6)
+        self.setHorizontalHeaderLabels(["Name", "Start", "End", "Size", "Attributes", "Sig"])
+        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
 
@@ -167,13 +539,18 @@ class SlicerTable(QtWidgets.QTableWidget):
             self.setItem(i, 1, QtWidgets.QTableWidgetItem(hex(entry.start)))
             self.setItem(i, 2, QtWidgets.QTableWidgetItem(hex(entry.end)))
 
+            size = entry.size()
+            self.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{hex(size)} ({size})"))
+
             perm_str = ""
             perm_str += "R" if entry.perm & ida_segment.SEGPERM_READ else "."
             perm_str += "W" if entry.perm & ida_segment.SEGPERM_WRITE else "."
             perm_str += "X" if entry.perm & ida_segment.SEGPERM_EXEC else "."
             attr_str = f"{perm_str} | T:{entry.seg_type} | A:{entry.align}"
-            self.setItem(i, 3, QtWidgets.QTableWidgetItem(attr_str))
-            self.setItem(i, 4, QtWidgets.QTableWidgetItem(entry.sig))
+            if entry.recursive:
+                attr_str += " | rec"
+            self.setItem(i, 4, QtWidgets.QTableWidgetItem(attr_str))
+            self.setItem(i, 5, QtWidgets.QTableWidgetItem(entry.sig))
 
     def show_context_menu(self, pos):
         selected_rows = [index.row() for index in self.selectionModel().selectedRows()]
@@ -201,9 +578,7 @@ class SlicerTable(QtWidgets.QTableWidget):
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key.Key_Delete:
-            selected_rows = [
-                index.row() for index in self.selectionModel().selectedRows()
-            ]
+            selected_rows = [index.row() for index in self.selectionModel().selectedRows()]
             if selected_rows:
                 self.delete_entries(selected_rows)
         else:
@@ -221,6 +596,8 @@ class SlicerTable(QtWidgets.QTableWidget):
         perm_edit = QtWidgets.QLineEdit(str(entry.perm))
         type_edit = QtWidgets.QLineEdit(str(entry.seg_type))
         align_edit = QtWidgets.QLineEdit(str(entry.align))
+        recursive_check = QtWidgets.QCheckBox("Re-scan references when the range changes")
+        recursive_check.setChecked(entry.recursive)
 
         layout.addRow("Name:", name_edit)
         layout.addRow("Start (hex):", start_edit)
@@ -228,28 +605,35 @@ class SlicerTable(QtWidgets.QTableWidget):
         layout.addRow("Permissions (int):", perm_edit)
         layout.addRow("Type (int):", type_edit)
         layout.addRow("Alignment (int):", align_edit)
+        layout.addRow("Recursive:", recursive_check)
 
-        buttons = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.StandardButton.Ok
-            | QtWidgets.QDialogButtonBox.StandardButton.Cancel
-        )
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addRow(buttons)
 
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             try:
+                old_start, old_end = entry.start, entry.end
                 entry.name = name_edit.text()
                 entry.start = int(start_edit.text(), 16)
                 entry.end = int(end_edit.text(), 16)
                 entry.perm = int(perm_edit.text())
                 entry.seg_type = int(type_edit.text())
                 entry.align = int(align_edit.text())
+                entry.recursive = recursive_check.isChecked()
                 entry.update_sig()
-                self.refresh()
-                self.plugin.save_config()
             except ValueError:
                 QtWidgets.QMessageBox.warning(self, "Error", "Invalid input format.")
+                return
+
+            self.refresh()
+            self.plugin.save_config()
+
+            # If this is a recursive entry and its range changed, scan the new
+            # range for references and add any newly discovered ranges.
+            if entry.recursive and (entry.start, entry.end) != (old_start, old_end):
+                self.plugin.rescan_range_entry(entry)
 
 
 class SlicerPluginForm(ida_kernwin.PluginForm):
@@ -276,6 +660,9 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.slice_button.clicked.connect(self.on_slice_clicked)
         self.layout.addWidget(self.slice_button)
 
+        self.merge_check = QtWidgets.QCheckBox("Merge all ranges into a single .seg file")
+        self.layout.addWidget(self.merge_check)
+
         self.save_seg_button = QtWidgets.QPushButton("Save segments to .seg files")
         self.save_seg_button.clicked.connect(self.on_save_seg_clicked)
         self.layout.addWidget(self.save_seg_button)
@@ -295,15 +682,13 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
 
         file_type_str = self.type_edit.text().strip()
         if not file_type_str:
-            QtWidgets.QMessageBox.warning(
-                self.parent, "Error", "Please enter a file type."
-            )
+            QtWidgets.QMessageBox.warning(self.parent, "Error", "Please enter a file type.")
             return
 
         self.plugin.perform_slice(self.table.entries, file_type_str)
 
     def on_save_seg_clicked(self):
-        self.plugin.save_segments_to_files(self.table.entries)
+        self.plugin.save_segments_to_files(self.table.entries, merge=self.merge_check.isChecked())
 
     def on_import_seg_clicked(self):
         self.plugin.import_segments_from_files()
@@ -322,6 +707,14 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
         self.mode = mode
 
     def activate(self, ctx):
+        if self.mode == "function_recursive":
+            ea = ctx.cur_ea
+            func = ida_funcs.get_func(ea)
+            if not func:
+                print("No function at current address.")
+                return 0
+            self.plugin.add_function_recursive(func.start_ea)
+            return 1
         if self.mode == "function":
             ea = ctx.cur_ea
             func = ida_funcs.get_func(ea)
@@ -345,16 +738,15 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
                 # Get the size of the item at current address (instruction or data)
                 item_size = ida_bytes.get_item_size(start)
                 end = start + item_size
-                print(
-                    f"No selection, adding current item at {hex(start)} (size {item_size})"
-                )
+                print(f"No selection, adding current item at {hex(start)} (size {item_size})")
 
         seg = ida_segment.getseg(start)
         if not seg:
             print("Address not in segment.")
             return 0
 
-        name = ida_segment.get_segm_name(seg)
+        # Function name for code inside a function, else "{segment}_{addr}".
+        name = self.plugin._range_name(start, seg)
         perm = seg.perm
         seg_type = seg.type
         align = seg.align
@@ -364,11 +756,7 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
         return 1
 
     def update(self, ctx):
-        return (
-            ida_kernwin.AST_ENABLE_FOR_WIDGET
-            if ctx.widget_type == ida_kernwin.BWN_DISASM
-            else ida_kernwin.AST_DISABLE_FOR_WIDGET
-        )
+        return ida_kernwin.AST_ENABLE_FOR_WIDGET if ctx.widget_type == ida_kernwin.BWN_DISASM else ida_kernwin.AST_DISABLE_FOR_WIDGET
 
 
 # --- Main Plugin ---
@@ -393,9 +781,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
     def _get_config_path(self):
         # Store in the same directory as the plugin
-        return os.path.join(
-            os.path.dirname(os.path.realpath(__file__)), "idaslicer_config.json"
-        )
+        return os.path.join(os.path.dirname(os.path.realpath(__file__)), "idaslicer_config.json")
 
     def load_config(self):
         path = self._get_config_path()
@@ -469,6 +855,13 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
+                "idaslicer:add_func_recursive",
+                "Add function recursively to slicer",
+                AddToSlicerHandler(self, "function_recursive"),
+            )
+        )
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
                 "idaslicer:add_sel",
                 "Add selection to slicer",
                 AddToSlicerHandler(self, "selection"),
@@ -484,6 +877,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
     def unregister_actions(self):
         ida_kernwin.unregister_action("idaslicer:add_func")
+        ida_kernwin.unregister_action("idaslicer:add_func_recursive")
         ida_kernwin.unregister_action("idaslicer:add_sel")
         ida_kernwin.unregister_action("idaslicer:add_seg")
 
@@ -492,6 +886,125 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.save_config()
         if self.form:
             self.form.table.refresh()
+
+    @staticmethod
+    def _apply_seg_attrs(seg_start, seg_type, align):
+        """Apply numeric segment type and alignment to a freshly created segment.
+        No-op when these were not recorded in the payload (None)."""
+        if seg_type is None and align is None:
+            return
+        s = ida_segment.getseg(seg_start)
+        if not s:
+            return
+        if seg_type is not None:
+            ida_segment.set_segm_type(seg_start, seg_type)
+        if align is not None:
+            s.align = align
+        s.update()
+
+    @staticmethod
+    def _range_name(start, seg):
+        """Name a range so it is easy to identify and naturally unique.
+        The base is the containing function name (for code inside a function)
+        or the segment name otherwise; the start address is always appended so
+        that several ranges sharing the same function/segment (e.g. multiple
+        selections within one function) never collide."""
+        base = None
+        flags = ida_bytes.get_flags(start)
+        if ida_bytes.is_code(flags):
+            func = ida_funcs.get_func(start)
+            if func:
+                base = ida_funcs.get_func_name(func.start_ea)
+        if not base:
+            base = ida_segment.get_segm_name(seg)
+        return f"{base}_{hex(start)}"
+
+    def _add_collected_ranges(self, ranges):
+        """Turn collected (start, end) ranges into recursive SlicerEntries,
+        dropping exact duplicates and ranges fully contained in an existing
+        entry or in a larger range from this same batch. Returns the count
+        added (does not save/refresh — the caller does)."""
+        existing = [(e.start, e.end) for e in self.entries]
+        existing_set = set(existing)
+
+        def _contained(s, e, others):
+            for cs, ce in others:
+                if cs <= s and e <= ce and (cs, ce) != (s, e):
+                    return True
+            return False
+
+        # Process largest ranges first so that a range fully contained in a
+        # bigger one (already present, or kept earlier in this pass) is dropped,
+        # avoiding redundant overlapping segments / overwrite prompts on import.
+        ordered = sorted(
+            {(s, e) for s, e in ranges if s < e},
+            key=lambda r: r[1] - r[0],
+            reverse=True,
+        )
+
+        kept = []
+        for start, end in ordered:
+            if (start, end) in existing_set:
+                continue
+            if _contained(start, end, existing) or _contained(start, end, kept):
+                continue
+            kept.append((start, end))
+
+        added = 0
+        for start, end in kept:
+            seg = ida_segment.getseg(start)
+            if not seg:
+                continue
+            name = self._range_name(start, seg)
+            entry = SlicerEntry(name, start, end, seg.perm, seg.type, seg.align, recursive=True)
+            self.entries.append(entry)
+            added += 1
+        return added
+
+    def add_function_recursive(self, start_ea: int):
+        """Add the function at start_ea and every code/data range it references
+        (recursively) to the slicer list."""
+        ida_kernwin.show_wait_box("Scanning recursive references...")
+        try:
+            ranges = collect_recursive_ranges(start_ea)
+        except Exception as e:
+            ida_kernwin.hide_wait_box()
+            print(f"[IDASlicer] Recursive scan failed: {e}")
+            QtWidgets.QMessageBox.critical(None, "Error", f"Recursive scan failed:\n{e}")
+            return
+        finally:
+            ida_kernwin.hide_wait_box()
+
+        added = self._add_collected_ranges(ranges)
+        self.save_config()
+        if self.form:
+            self.form.table.refresh()
+
+        print(f"[IDASlicer] Recursive scan of {hex(start_ea)}: {len(ranges)} ranges found, {added} added to slicer list.")
+        ida_kernwin.info(f"Added {added} ranges to the slicer list.")
+
+    def rescan_range_entry(self, entry):
+        """Re-scan an edited recursive entry's range for references and add any
+        newly discovered ranges to the slicer list."""
+        ida_kernwin.show_wait_box("Re-scanning edited range...")
+        try:
+            ranges = collect_recursive_ranges_from_range(entry.start, entry.end)
+        except Exception as e:
+            ida_kernwin.hide_wait_box()
+            print(f"[IDASlicer] Re-scan failed: {e}")
+            QtWidgets.QMessageBox.critical(None, "Error", f"Re-scan failed:\n{e}")
+            return
+        finally:
+            ida_kernwin.hide_wait_box()
+
+        added = self._add_collected_ranges(ranges)
+        self.save_config()
+        if self.form:
+            self.form.table.refresh()
+
+        print(f"[IDASlicer] Re-scan of {hex(entry.start)}-{hex(entry.end)}: {len(ranges)} ranges found, {added} new added to slicer list.")
+        if added:
+            ida_kernwin.info(f"Added {added} new ranges from the re-scan.")
 
     def detect_file_type(self):
         ftype_enum = ida_ida.inf_get_filetype()
@@ -516,9 +1029,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
         if not os.path.exists(template_path):
             print(f"Template not found: {template_path}")
-            QtWidgets.QMessageBox.warning(
-                None, "Error", f"Template not found:\n{template_path}"
-            )
+            QtWidgets.QMessageBox.warning(None, "Error", f"Template not found:\n{template_path}")
             return
 
         input_path = ida_nalt.get_input_file_path()
@@ -532,9 +1043,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             print(f"Copied template to {out_path}")
         except Exception as e:
             print(f"Failed to copy template: {e}")
-            QtWidgets.QMessageBox.critical(
-                None, "Error", f"Failed to copy template:\n{e}"
-            )
+            QtWidgets.QMessageBox.critical(None, "Error", f"Failed to copy template:\n{e}")
             return
 
         # Prepare data for subprocess
@@ -548,6 +1057,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     "start": entry.start,
                     "end": entry.end,
                     "perm": entry.perm,
+                    "seg_type": entry.seg_type,
+                    "align": entry.align,
                     "seg_class": seg_class,
                     "content": content,
                 }
@@ -591,27 +1102,46 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             )
             if result.returncode == 0:
                 print(f"Slicing complete. Saved to: {out_path}")
-                QtWidgets.QMessageBox.information(
-                    None, "Success", f"File saved to:\n{out_path}"
-                )
+                QtWidgets.QMessageBox.information(None, "Success", f"File saved to:\n{out_path}")
             else:
                 error_msg = result.stderr or result.stdout
                 print(f"Subprocess failed:\n{error_msg}")
-                QtWidgets.QMessageBox.critical(
-                    None, "Error", f"Subprocess failed:\n{error_msg}"
-                )
+                QtWidgets.QMessageBox.critical(None, "Error", f"Subprocess failed:\n{error_msg}")
         except Exception as e:
             print(f"Error during subprocess orchestration: {e}")
-            QtWidgets.QMessageBox.critical(
-                None, "Error", f"Error during subprocess orchestration:\n{e}"
-            )
+            QtWidgets.QMessageBox.critical(None, "Error", f"Error during subprocess orchestration:\n{e}")
         finally:
             if os.path.exists(data_path):
                 os.remove(data_path)
             if os.path.exists(script_path):
                 os.remove(script_path)
 
-    def save_segments_to_files(self, entries: list[SlicerEntry]):
+    @staticmethod
+    def _build_payload(entry):
+        """Build the pickled payload dict for one entry, or None if its bytes
+        can't be read."""
+        size = entry.size()
+        if size <= 0:
+            return None
+        content = ida_bytes.get_bytes(entry.start, size)
+        if content is None:
+            print(f"Failed to read bytes at {hex(entry.start)}")
+            return None
+        entry.update_sig()
+        return {
+            "version": SEG_FILE_VERSION,
+            "name": entry.name,
+            "start": entry.start,
+            "end": entry.end,
+            "perm": entry.perm,
+            "seg_type": entry.seg_type,
+            "align": entry.align,
+            "seg_class": get_seg_class(entry.seg_type),
+            "sig": entry.sig,
+            "content": content,
+        }
+
+    def save_segments_to_files(self, entries: list[SlicerEntry], merge=False):
         if not entries:
             print("No entries to save.")
             return
@@ -623,36 +1153,49 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
         out_dir = os.path.dirname(input_path)
 
-        count = 0
-        for entry in entries:
-            size = entry.size()
-            if size <= 0:
-                continue
+        payloads = [p for p in (self._build_payload(e) for e in entries) if p]
+        if not payloads:
+            QtWidgets.QMessageBox.warning(None, "Error", "No ranges with readable bytes to save.")
+            return
 
-            content = ida_bytes.get_bytes(entry.start, size)
-            if content is None:
-                print(f"Failed to read bytes at {hex(entry.start)}")
-                continue
-
-            # Update sig to reflect current memory state
-            entry.update_sig()
-
-            # Format: {name}_{start}_{end}_{perm}_{seg_class}_{sig}.seg
-            filename = f"{entry.name}_{hex(entry.start)}_{hex(entry.end)}_{hex(entry.perm)}_{get_seg_class(entry.seg_type)}_{entry.sig}.seg"
-            # Sanitize filename
-            filename = "".join([c for c in filename if c not in '<>:"/\\|?*'])
-            file_path = os.path.join(out_dir, filename)
-
+        if merge:
+            # Merging only bundles many ranges into one file for convenient
+            # transport/import; every per-range rule (overlap handling, naming,
+            # seg attrs, md5) is unchanged - the importer just unpacks the list
+            # and processes each payload exactly as a standalone file.
+            base = os.path.splitext(os.path.basename(input_path))[0]
+            file_path = os.path.join(out_dir, f"{base}_merged.seg")
+            merged = {
+                "version": SEG_FILE_VERSION,
+                "merged": True,
+                "entries": payloads,
+            }
             try:
                 with open(file_path, "wb") as f:
-                    f.write(content)
+                    pickle.dump(merged, f)
+            except Exception as e:
+                print(f"Failed to write merged file {file_path}: {e}")
+                QtWidgets.QMessageBox.critical(None, "Error", f"Failed to write merged file:\n{e}")
+                return
+            QtWidgets.QMessageBox.information(None, "Success", f"Saved {len(payloads)} ranges into:\n{file_path}")
+            return
+
+        # The filename is purely cosmetic (metadata lives in the payload): name +
+        # address range for readability/uniqueness, sanitized and length-capped.
+        count = 0
+        for payload in payloads:
+            name = "".join([c for c in payload["name"] if c not in '<>:"/\\|?*'])
+            suffix = f"_{hex(payload['start'])}_{hex(payload['end'])}.seg"
+            name = _truncate_filename_name(name, suffix)
+            file_path = os.path.join(out_dir, name + suffix)
+            try:
+                with open(file_path, "wb") as f:
+                    pickle.dump(payload, f)
                 count += 1
             except Exception as e:
                 print(f"Failed to write file {file_path}: {e}")
 
-        QtWidgets.QMessageBox.information(
-            None, "Success", f"Successfully saved {count} segment files to:\n{out_dir}"
-        )
+        QtWidgets.QMessageBox.information(None, "Success", f"Successfully saved {count} segment files to:\n{out_dir}")
 
     def import_segments_from_files(self):
         if not ida_domain:
@@ -688,53 +1231,50 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     counter += 1
                 return f"{base_name}{counter}"
 
-            for file_path in files:
-                filename = os.path.basename(file_path)
-                if not filename.endswith(".seg"):
-                    continue
+            required_keys = {"start", "end", "perm", "seg_class", "content"}
 
-                # Parse: {name}_{start}_{end}_{perm}_{seg_class}_{sig}.seg
-                parts = filename[:-4].split("_")
-                if len(parts) < 6:
-                    print(f"Skipping invalid filename (too few parts): {filename}")
-                    continue
+            def process_payload(payload, src):
+                """Import one range payload. Merging changes nothing here: a
+                merged file just yields several payloads, each handled exactly
+                like a standalone single-range file."""
+                nonlocal overwrite_all
+                if not isinstance(payload, dict) or not required_keys.issubset(payload):
+                    print(f"Skipping invalid segment in {src}")
+                    return
 
-                expected_sig = parts[-1]
-                seg_class = parts[-2]
-                try:
-                    perm = int(parts[-3], 16)
-                    end = int(parts[-4], 16)
-                    start = int(parts[-5], 16)
-                except ValueError:
-                    print(f"Skipping invalid hex values in filename: {filename}")
-                    continue
+                name = payload.get("name", "")
+                start = payload["start"]
+                end = payload["end"]
+                perm = payload["perm"]
+                seg_type = payload.get("seg_type")
+                align = payload.get("align")
+                seg_class = payload["seg_class"]
+                content = payload["content"]
+                expected_sig = payload.get("sig")
 
-                name = "_".join(parts[:-5])
-
-                try:
-                    with open(file_path, "rb") as f:
-                        content = f.read()
-                except Exception as e:
-                    print(f"Failed to read {file_path}: {e}")
-                    continue
+                # Strip the original "_{start}" suffix so each created segment can
+                # be (re)named "{base}_{its own start}". A single imported range
+                # may be split into several segments around existing ones, and
+                # naming each by its actual start keeps them unique/identifiable.
+                addr_suffix = f"_{hex(start)}"
+                base_name = name[: -len(addr_suffix)] if name.endswith(addr_suffix) else name
 
                 # MD5 Validation
                 actual_sig = hashlib.md5(content).hexdigest()
-                if actual_sig != expected_sig:
-                    msg = f"MD5 mismatch for {filename}!\n\nExpected: {expected_sig}\nActual: {actual_sig}\n\nDo you want to skip this file?"
+                if expected_sig and actual_sig != expected_sig:
+                    msg = f"MD5 mismatch for {base_name or src}!\n\nExpected: {expected_sig}\nActual: {actual_sig}\n\nDo you want to skip this range?"
                     res = QtWidgets.QMessageBox.question(
                         None,
                         "Validation Error",
                         msg,
-                        QtWidgets.QMessageBox.StandardButton.Yes
-                        | QtWidgets.QMessageBox.StandardButton.No,
+                        QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
                         QtWidgets.QMessageBox.StandardButton.Yes,
                     )
                     if res == QtWidgets.QMessageBox.StandardButton.Yes:
-                        continue
+                        return
 
                 if len(content) != (end - start):
-                    print(f"Content size mismatch for {filename}")
+                    print(f"Content size mismatch for {base_name or src}")
 
                 # Find all overlapping segments
                 overlaps = []
@@ -755,15 +1295,10 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                         msg_box = QtWidgets.QMessageBox()
                         msg_box.setWindowTitle("Overwrite Conflict")
                         msg_box.setText(
-                            f"The segment from '{filename}' overlaps with existing segment '{db.segments.get_name(s)}' at {hex(o_start)}-{hex(o_end)}.\n\nDo you want to overwrite the data?"
+                            f"The range '{base_name}' overlaps with existing segment '{db.segments.get_name(s)}' at {hex(o_start)}-{hex(o_end)}.\n\nDo you want to overwrite the data?"
                         )
-                        msg_box.setStandardButtons(
-                            QtWidgets.QMessageBox.StandardButton.Yes
-                            | QtWidgets.QMessageBox.StandardButton.No
-                        )
-                        msg_box.setDefaultButton(
-                            QtWidgets.QMessageBox.StandardButton.No
-                        )
+                        msg_box.setStandardButtons(QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+                        msg_box.setDefaultButton(QtWidgets.QMessageBox.StandardButton.No)
 
                         cb = QtWidgets.QCheckBox("Apply to all remaining conflicts")
                         msg_box.setCheckBox(cb)
@@ -778,45 +1313,53 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     offset = o_start - start
                     chunk = content[offset : offset + (o_end - o_start)]
                     db.bytes.set_bytes_at(o_start, chunk)
-                    results.append(
-                        f"Overwrote part of '{db.segments.get_name(s)}' at {hex(o_start)}-{hex(o_end)}"
-                    )
+                    results.append(f"Overwrote part of '{db.segments.get_name(s)}' at {hex(o_start)}-{hex(o_end)}")
 
                 # 2. Create segments for gaps
                 current_pos = start
                 for s in overlaps:
                     if current_pos < s.start_ea:
-                        unique_name = get_unique_name(name, existing_names)
-                        new_seg = db.segments.add(
-                            0, current_pos, s.start_ea, unique_name, seg_class
-                        )
+                        unique_name = get_unique_name(f"{base_name}_{hex(current_pos)}", existing_names)
+                        new_seg = db.segments.add(0, current_pos, s.start_ea, unique_name, seg_class)
                         if new_seg:
                             db.segments.set_permissions(new_seg, perm)
+                            self._apply_seg_attrs(current_pos, seg_type, align)
                             offset = current_pos - start
-                            chunk = content[
-                                offset : offset + (s.start_ea - current_pos)
-                            ]
+                            chunk = content[offset : offset + (s.start_ea - current_pos)]
                             db.bytes.set_bytes_at(current_pos, chunk)
-                            results.append(
-                                f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}"
-                            )
+                            results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}")
                             existing_names.append(unique_name)
                     current_pos = max(current_pos, s.end_ea)
 
                 if current_pos < end:
-                    unique_name = get_unique_name(name, existing_names)
-                    new_seg = db.segments.add(
-                        0, current_pos, end, unique_name, seg_class
-                    )
+                    unique_name = get_unique_name(f"{base_name}_{hex(current_pos)}", existing_names)
+                    new_seg = db.segments.add(0, current_pos, end, unique_name, seg_class)
                     if new_seg:
                         db.segments.set_permissions(new_seg, perm)
+                        self._apply_seg_attrs(current_pos, seg_type, align)
                         offset = current_pos - start
                         chunk = content[offset : offset + (end - current_pos)]
                         db.bytes.set_bytes_at(current_pos, chunk)
-                        results.append(
-                            f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}"
-                        )
+                        results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}")
                         existing_names.append(unique_name)
+
+            for file_path in files:
+                filename = os.path.basename(file_path)
+
+                try:
+                    with open(file_path, "rb") as f:
+                        data = pickle.load(f)
+                except Exception as e:
+                    print(f"Failed to read {filename}: {e}")
+                    continue
+
+                # A merged file is a wrapper dict carrying a list of payloads; a
+                # single-range file is the payload dict itself.
+                if isinstance(data, dict) and isinstance(data.get("entries"), list):
+                    for payload in data["entries"]:
+                        process_payload(payload, filename)
+                else:
+                    process_payload(data, filename)
 
         summary = "\n".join(results) if results else "No changes made."
         QtWidgets.QMessageBox.information(None, "Import Summary", summary)
@@ -829,15 +1372,10 @@ class SlicerUIHooks(ida_kernwin.UI_Hooks):
 
     def finish_populating_widget_popup(self, widget, popup):
         if ida_kernwin.get_widget_type(widget) == ida_kernwin.BWN_DISASM:
-            ida_kernwin.attach_action_to_popup(
-                widget, popup, "idaslicer:add_func", "Add to Slicer/"
-            )
-            ida_kernwin.attach_action_to_popup(
-                widget, popup, "idaslicer:add_sel", "Add to Slicer/"
-            )
-            ida_kernwin.attach_action_to_popup(
-                widget, popup, "idaslicer:add_seg", "Add to Slicer/"
-            )
+            ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_func", "Add to Slicer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_func_recursive", "Add to Slicer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_sel", "Add to Slicer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_seg", "Add to Slicer/")
 
 
 def PLUGIN_ENTRY():
