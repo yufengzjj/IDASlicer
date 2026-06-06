@@ -1,3 +1,4 @@
+import ida_idp
 import hashlib
 import json
 import os
@@ -25,7 +26,7 @@ from PySide6 import QtCore, QtWidgets
 try:
     import ida_domain
 except ImportError:
-    ida_domain = None
+    ida_domain = None  # ty:ignore[invalid-assignment]
 
 WORKER_SCRIPT = """
 import sys
@@ -327,8 +328,8 @@ def reconstruct_func_range(start_ea):
                     stack.append(xref.to)
 
         # Fall through to the next instruction unless this one stops flow
-        # (B, RET, ...). Calls (BL) don't stop flow, so execution continues.
-        if not (insn.get_canon_feature() & idaapi.CF_STOP):
+        # (RET, ...). Calls (BL) don't stop flow, so execution continues.
+        if not ida_idp.is_ret_insn(insn):
             nxt = ea + size
             if not _is_other_func_start(nxt):
                 stack.append(nxt)
@@ -1011,7 +1012,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.last_import_path = ""
         self.load_config()
         self.register_actions()
-        self.hooks = SlicerUIHooks(self)
+        self.hooks = SlicerUIHooks(self)  # ty:ignore[missing-argument]
         self.hooks.hook()
         return ida_idaapi.PLUGIN_KEEP
 
@@ -1050,7 +1051,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     config = json.load(f)
-            except:
+            except:  # noqa: E722
                 pass
 
         config["last_import_path"] = self.last_import_path
@@ -1060,7 +1061,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             md5_hex = md5.hex()
             if "entries" not in config:
                 config["entries"] = {}
-            config["entries"][md5_hex] = [e.to_dict() for e in self.entries]
+            config["entries"][md5_hex] = [e.to_dict() for e in self.entries]  # ty:ignore[invalid-assignment]
 
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -1076,7 +1077,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
     def run(self, arg):
         self.load_config()
         if not self.form:
-            self.form = SlicerPluginForm(self)
+            self.form = SlicerPluginForm(self)  # ty:ignore[missing-argument]
         self.form.Show("Slicer List")
         if self.form:
             self.form.table.refresh()
@@ -1086,28 +1087,28 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             ida_kernwin.action_desc_t(
                 "idaslicer:add_func",
                 "Add function to slicer",
-                AddToSlicerHandler(self, "function"),
+                AddToSlicerHandler(self, "function"),  # ty:ignore[too-many-positional-arguments]
             )
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
                 "idaslicer:add_func_recursive",
                 "Add function recursively to slicer",
-                AddToSlicerHandler(self, "function_recursive"),
+                AddToSlicerHandler(self, "function_recursive"),# ty:ignore[too-many-positional-arguments]
             )
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
                 "idaslicer:add_sel",
                 "Add selection to slicer",
-                AddToSlicerHandler(self, "selection"),
+                AddToSlicerHandler(self, "selection"),# ty:ignore[too-many-positional-arguments]
             )
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
                 "idaslicer:add_seg",
                 "Add current segment to slicer",
-                AddToSlicerHandler(self, "segment"),
+                AddToSlicerHandler(self, "segment"),# ty:ignore[too-many-positional-arguments]
             )
         )
 
@@ -1133,9 +1134,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         if not s:
             return
         if seg_type is not None:
-            s.type = seg_type
+            s.type = seg_type  # ty:ignore[invalid-assignment]
         if align is not None:
-            s.align = align
+            s.align = align  # ty:ignore[invalid-assignment]
         s.update()
 
     @staticmethod
@@ -1653,7 +1654,7 @@ class SlicerUIHooks(ida_kernwin.UI_Hooks):
         super(SlicerUIHooks, self).__init__()
         self.plugin = plugin
 
-    def finish_populating_widget_popup(self, widget, popup):
+    def finish_populating_widget_popup(self, widget, popup):  # ty:ignore[invalid-method-override]
         if ida_kernwin.get_widget_type(widget) == ida_kernwin.BWN_DISASM:
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_func", "Add to Slicer/")
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_func_recursive", "Add to Slicer/")
@@ -1662,4 +1663,4 @@ class SlicerUIHooks(ida_kernwin.UI_Hooks):
 
 
 def PLUGIN_ENTRY():
-    return IDASlicerPlugin()
+    return IDASlicerPlugin()  # ty:ignore[missing-argument]
