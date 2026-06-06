@@ -17,6 +17,7 @@ import ida_name
 import ida_range
 import ida_segment
 import ida_ua
+import ida_xref
 import idaapi
 import idautils
 from PySide6 import QtCore, QtWidgets
@@ -233,6 +234,108 @@ def get_loose_data_range(ea, max_explore_len=0):
     return ida_range.range_t(ea, end_ea)
 
 
+def _gap_is_pure_data(gap_start, gap_end):
+    """True if [gap_start, gap_end) is fully mapped and contains no code -- i.e.
+    it is data/undefined bytes (an inline literal pool or jump table) embedded
+    between two code blocks of the same function, as opposed to code belonging
+    to some other function that a far jump skipped over."""
+    ea = gap_start
+    while ea < gap_end:
+        if not ida_bytes.is_mapped(ea):
+            return False
+        if ida_bytes.is_code(ida_bytes.get_flags(ea)):
+            return False
+        nxt = ida_bytes.get_item_end(ea)
+        if nxt <= ea:
+            return False
+        ea = nxt
+    return True
+
+
+def _merge_code_intervals(intervals):
+    """Merge per-instruction intervals into contiguous code runs, then bridge
+    the gap between two adjacent runs ONLY when it is entirely non-code (an
+    embedded literal pool / jump table). Gaps that contain code are left
+    unbridged, so a far `B` that jumps over other functions produces separate
+    ranges instead of one giant span that swallows them."""
+    if not intervals:
+        return []
+    intervals.sort()
+    runs = []
+    cs, ce = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= ce:  # contiguous / overlapping instructions
+            ce = max(ce, e)
+        else:
+            runs.append((cs, ce))
+            cs, ce = s, e
+    runs.append((cs, ce))
+
+    merged = []
+    cs, ce = runs[0]
+    for s, e in runs[1:]:
+        if s > ce and _gap_is_pure_data(ce, s):
+            ce = e  # bridge across the embedded-data gap
+        else:
+            merged.append((cs, ce))
+            cs, ce = s, e
+    merged.append((cs, ce))
+    return merged
+
+
+def reconstruct_func_range(start_ea):
+    """Best-effort reconstruction of a function's extent when IDA has NOT
+    defined a function at `start_ea` -- e.g. a control-flow-flattened or
+    obfuscated routine that has data (jump tables / inline constants) embedded
+    between its code blocks, which makes IDA refuse to create a function.
+
+    Floods intra-procedural control flow from `start_ea`: follows fall-through
+    and local jump targets, but NOT calls (BL/CALL target other functions) and
+    does not cross into a different already-defined function (tail calls).
+
+    Returns a LIST of (start, end) ranges -- the reached code blocks, with
+    embedded pure-data gaps bridged. It deliberately does NOT collapse to a
+    single [lo, hi] span: a far jump (e.g. a tail jump that skips over other
+    functions) leaves a gap containing code, which is not bridged, so unrelated
+    functions in between are never swallowed. Returns [] when nothing decodes."""
+    visited = set()
+    stack = [start_ea]
+    intervals = []
+
+    def _is_other_func_start(ea):
+        f = ida_funcs.get_func(ea)
+        return f is not None and f.start_ea == ea and f.start_ea != start_ea
+
+    while stack:
+        ea = stack.pop()
+        if ea == idaapi.BADADDR or ea in visited or not ida_bytes.is_mapped(ea):
+            continue
+        if not ida_bytes.is_code(ida_bytes.get_flags(ea)):
+            continue
+        insn = ida_ua.insn_t()  # ty:ignore[missing-argument]
+        size = ida_ua.decode_insn(insn, ea)
+        if size <= 0:
+            continue
+        visited.add(ea)
+        intervals.append((ea, ea + size))
+
+        # Follow jump targets that stay within this procedure. Skip calls and
+        # jumps that land on the start of another defined function (tail calls).
+        for xref in idautils.XrefsFrom(ea, 0):
+            if xref.type in (ida_xref.fl_JN, ida_xref.fl_JF):
+                if not _is_other_func_start(xref.to):
+                    stack.append(xref.to)
+
+        # Fall through to the next instruction unless this one stops flow
+        # (B, RET, ...). Calls (BL) don't stop flow, so execution continues.
+        if not (insn.get_canon_feature() & idaapi.CF_STOP):
+            nxt = ea + size
+            if not _is_other_func_start(nxt):
+                stack.append(nxt)
+
+    return _merge_code_intervals(intervals)
+
+
 def check_func_range(
     ranges: list,
     ref: int,
@@ -270,10 +373,18 @@ def check_c_ref_range(
     processed_ranges: set,
 ):
     """check code ref at addr"""
-    for ref in idautils.CodeRefsFrom(addr, False):
-        if cur_range[0] <= ref < cur_range[1]:
+    for ref in idautils.XrefsFrom(addr, ida_xref.XREF_FAR):
+        if cur_range[0] <= ref.to < cur_range[1]:
             continue
-        check_func_range(ranges, ref, cur_func, funcs_to_export, processed_ranges)
+        if ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+            func = ida_funcs.get_func(ref.to)
+            if not func:
+                for s, e in reconstruct_func_range(ref.to):
+                    r = ida_range.range_t(s, e)
+                    if (s, e) not in processed_ranges and r not in ranges:
+                        ranges.append(r)
+                continue
+        check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges)
 
 
 def get_ref_from_insn(ea):
@@ -285,7 +396,7 @@ def get_ref_from_insn(ea):
     if mn not in ("ADR", "ADRL", "ADRP", "LDR"):
         return None
     if mn in ("ADRP", "LDR"):
-        for xref in idautils.XrefsFrom(ea, idaapi.XREF_DATA):
+        for xref in idautils.XrefsFrom(ea, ida_xref.XREF_DATA):
             return xref.to
     for op in insn.ops:
         if op.type in (idaapi.o_mem, idaapi.o_imm, idaapi.o_far, idaapi.o_near):
@@ -303,7 +414,7 @@ def check_o_ref_range(
     funcs_to_export: list | None,
     processed_ranges: set,
     skip_named_data: bool = False,
-    max_explore_len: int = 0,
+    max_explore_len: int = 128,
 ):
     """check code opraand ref in cur_range"""
     for head in idautils.Heads(*cur_range):
@@ -352,11 +463,9 @@ def check_d_ref_range(
             if data is not None and len(data) == ptr_size:
                 ptr = int.from_bytes(data, "big" if ida_ida.inf_is_be() else "little")
                 if (
-                    not (cur_range[0] <= ptr < cur_range[1])
-                    and ptr != 0
-                    and ptr != idaapi.BADADDR
-                    and ida_bytes.is_mapped(ptr)
-                    and ida_segment.segtype(ptr) != ida_segment.SEG_XTRN
+                    not (cur_range[0] <= ptr < cur_range[1]) and ptr != 0 and ptr != idaapi.BADADDR and ida_bytes.is_mapped(ptr)
+                    # need the name have to include ranges in SEG_XTRN
+                    # and ida_segment.segtype(ptr) != ida_segment.SEG_XTRN
                 ):
                     flags = ida_bytes.get_flags(ptr)
                     if ida_bytes.is_code(flags):
@@ -540,6 +649,21 @@ def collect_recursive_ranges_from_range(start, end) -> list:
     return collected
 
 
+def collect_recursive_ranges_from_ranges(seed_ranges) -> list:
+    """Like `collect_recursive_ranges_from_range`, but seeded from several loose
+    ranges at once (e.g. the blocks returned by `reconstruct_func_range` for a
+    function IDA never defined). The seeds are treated as not belonging to any
+    function (`_NO_FUNC`); each is scanned for references and everything
+    reachable is collected. The seed ranges themselves are included."""
+    processed_ranges = set()
+    funcs_to_export = []
+    collected = []
+    seeds = [ida_range.range_t(s, e) for s, e in seed_ranges if s < e]
+    _scan_worklist(seeds, _NO_FUNC, collected, funcs_to_export, processed_ranges)
+    _drain_functions(funcs_to_export, collected, processed_ranges)
+    return collected
+
+
 # --- UI Components ---
 
 
@@ -547,12 +671,14 @@ class SlicerTable(QtWidgets.QTableWidget):
     def __init__(self, plugin, parent=None):
         super(SlicerTable, self).__init__(parent)
         self.plugin = plugin
+        self._filter_text = ""
         self.setColumnCount(6)
         self.setHorizontalHeaderLabels(["Name", "Start", "End", "Size", "Attributes", "Sig"])
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
+        self.cellClicked.connect(self.on_cell_clicked)
 
     @property
     def entries(self):
@@ -583,6 +709,34 @@ class SlicerTable(QtWidgets.QTableWidget):
                 attr_str += " | rec"
             self.setItem(i, 4, QtWidgets.QTableWidgetItem(attr_str))
             self.setItem(i, 5, QtWidgets.QTableWidgetItem(entry.sig))
+        self.apply_filter(self._filter_text)
+
+    def apply_filter(self, text):
+        """Hide rows where no column contains `text` (case-insensitive)."""
+        self._filter_text = text or ""
+        needle = self._filter_text.lower()
+        for row in range(self.rowCount()):
+            hit = not needle
+            if not hit:
+                for col in range(self.columnCount()):
+                    item = self.item(row, col)
+                    if item and needle in item.text().lower():
+                        hit = True
+                        break
+            self.setRowHidden(row, not hit)
+
+    def on_cell_clicked(self, row, col):
+        """Clicking the Start or End cell jumps the IDA view to that address."""
+        if col not in (1, 2):
+            return
+        item = self.item(row, col)
+        if item is None:
+            return
+        try:
+            ea = int(item.text(), 16)
+        except ValueError:
+            return
+        ida_kernwin.jumpto(ea)
 
     def show_context_menu(self, pos):
         selected_rows = [index.row() for index in self.selectionModel().selectedRows()]
@@ -677,7 +831,16 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.parent = self.FormToPyQtWidget(form)
         self.layout = QtWidgets.QVBoxLayout(self.parent)
 
+        search_layout = QtWidgets.QHBoxLayout()
+        search_layout.addWidget(QtWidgets.QLabel("Search:"))
+        self.search_edit = QtWidgets.QLineEdit()
+        self.search_edit.setPlaceholderText("Filter rows by any field...")
+        self.search_edit.setClearButtonEnabled(True)
+        search_layout.addWidget(self.search_edit)
+        self.layout.addLayout(search_layout)
+
         self.table = SlicerTable(self.plugin)
+        self.search_edit.textChanged.connect(self.table.apply_filter)
         self.layout.addWidget(self.table)
         self.table.refresh()
 
@@ -742,18 +905,40 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
         if self.mode == "function_recursive":
             ea = ctx.cur_ea
             func = ida_funcs.get_func(ea)
-            if not func:
-                print("No function at current address.")
-                return 0
-            self.plugin.add_function_recursive(func.start_ea)
+            if func:
+                self.plugin.add_function_recursive(func.start_ea)
+            else:
+                # IDA hasn't defined a function here: reconstruct its extent by
+                # flooding control flow, then seed the recursive scan from it.
+                blocks = reconstruct_func_range(ea)
+                if not blocks:
+                    print("Could not reconstruct a function range at current address.")
+                    return 0
+                self.plugin.add_ranges_recursive(blocks)
             return 1
         if self.mode == "function":
             ea = ctx.cur_ea
             func = ida_funcs.get_func(ea)
-            if not func:
-                print("No function at current address.")
-                return 0
-            start, end = func.start_ea, func.end_ea
+            blocks = []
+            if func:
+                funcs_to_export = [func.start_ea]
+                processed_ranges = set()
+                _drain_functions(funcs_to_export, blocks, processed_ranges)
+            else:
+                # No IDA function: reconstruct the full extent (code blocks +
+                # embedded data) by flooding control flow. This may yield several
+                # disjoint blocks (a far jump leaves a code gap unbridged), so
+                # add each as its own entry instead of one giant span.
+                blocks = reconstruct_func_range(ea)
+                if not blocks:
+                    print("Could not reconstruct a function range at current address.")
+                    return 0
+            for s, e in blocks:
+                bseg = ida_segment.getseg(s)
+                if not bseg:
+                    continue
+                self.plugin.add_to_list(SlicerEntry(self.plugin._range_name(s, bseg), s, e, bseg.perm, bseg.type, bseg.align))
+            return 1
         elif self.mode == "segment":
             ea = ctx.cur_ea
             seg = ida_segment.getseg(ea)
@@ -1013,6 +1198,30 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             self.form.table.refresh()
 
         print(f"[IDASlicer] Recursive scan of {hex(start_ea)}: {len(ranges)} ranges found, {added} added to slicer list.")
+        ida_kernwin.info(f"Added {added} ranges to the slicer list.")
+
+    def add_ranges_recursive(self, seed_ranges):
+        """Like `add_function_recursive`, but seeded from reconstructed ranges
+        instead of an IDA-defined function. Used when IDA has not turned the
+        code into a function (see `reconstruct_func_range`)."""
+        ida_kernwin.show_wait_box("Scanning recursive references...")
+        try:
+            ranges = collect_recursive_ranges_from_ranges(seed_ranges)
+        except Exception as e:
+            ida_kernwin.hide_wait_box()
+            print(f"[IDASlicer] Recursive scan failed: {e}")
+            QtWidgets.QMessageBox.critical(None, "Error", f"Recursive scan failed:\n{e}")
+            return
+        finally:
+            ida_kernwin.hide_wait_box()
+
+        added = self._add_collected_ranges(ranges)
+        self.save_config()
+        if self.form:
+            self.form.table.refresh()
+
+        seeds = ", ".join(hex(s) for s, _ in seed_ranges) or "(none)"
+        print(f"[IDASlicer] Recursive scan of [{seeds}]: {len(ranges)} ranges found, {added} added to slicer list.")
         ida_kernwin.info(f"Added {added} ranges to the slicer list.")
 
     def rescan_range_entry(self, entry):
@@ -1396,9 +1605,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
                 # 3. Restore names collected from the source database.
                 for off, nm in payload.get("names", []):
-                    ida_name.set_name(
-                        start + off, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK
-                    )
+                    ida_name.set_name(start + off, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK)
 
             for file_path in files:
                 filename = os.path.basename(file_path)
