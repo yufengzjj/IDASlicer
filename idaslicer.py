@@ -700,13 +700,37 @@ class SlicerTable(QtWidgets.QTableWidget):
         edit_action = None
         if len(selected_rows) == 1:
             edit_action = menu.addAction("Edit")
+        recreate_action = menu.addAction("Recreate function")
         delete_action = menu.addAction("Delete")
 
         action = menu.exec(self.mapToGlobal(pos))
         if edit_action and action == edit_action:
             self.edit_entry(selected_rows[0])
+        elif action == recreate_action:
+            self.recreate_functions(selected_rows)
         elif action == delete_action:
             self.delete_entries(selected_rows)
+
+    def recreate_functions(self, rows):
+        """Undefine the code in each selected range, then (re)create a function
+        at the range start. Useful when IDA's auto-analysis got the function
+        bounds wrong and the slice range carries the intended extent."""
+        for row in rows:
+            entry = self.entries[row]
+            start, end = entry.start, entry.end
+            size = end - start
+            if size <= 0:
+                continue
+            # Drop any function already covering the start so add_func can
+            # redefine it cleanly, then undefine the whole range.
+            existing = ida_funcs.get_func(start)
+            if existing is not None:
+                ida_funcs.del_func(existing.start_ea)
+            ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, size)
+            if not ida_funcs.add_func(start, end):
+                # Fall back to letting IDA pick the end if explicit bounds fail.
+                ida_funcs.add_func(start)
+        ida_kernwin.request_refresh(ida_kernwin.IWID_DISASMS)
 
     def delete_entries(self, rows):
         # Sort rows in reverse order to pop from the end to keep indices valid
@@ -1432,6 +1456,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.save_config()
 
         results = []
+        imported_entries = []
+        existing_ranges = {(e.start, e.end) for e in self.entries}
         overwrite_all = False
         with ida_domain.Database.open(save_on_close=False) as db:
             existing_names = [s.name for s in db.segments]
@@ -1560,6 +1586,22 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 for off, nm in payload.get("names", []):
                     ida_name.set_name(start + off, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK)
 
+                # 4. Surface the imported range in the slicer list so the user
+                # can see what was brought in. The content is already written to
+                # the database above, so the entry's signature matches.
+                if (start, end) not in existing_ranges:
+                    existing_ranges.add((start, end))
+                    imported_entries.append(
+                        SlicerEntry(
+                            base_name or f"imported_{hex(start)}",
+                            start,
+                            end,
+                            perm,
+                            seg_type if seg_type is not None else 0,
+                            align if align is not None else 0,
+                        )
+                    )
+
             for file_path in files:
                 filename = os.path.basename(file_path)
 
@@ -1577,6 +1619,12 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                         process_payload(payload, filename)
                 else:
                     process_payload(data, filename)
+
+        if imported_entries:
+            self.entries.extend(imported_entries)
+            self.save_config()
+            if self.form:
+                self.form.table.refresh()
 
         summary = "\n".join(results) if results else "No changes made."
         QtWidgets.QMessageBox.information(None, "Import Summary", summary)
