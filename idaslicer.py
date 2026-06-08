@@ -1,4 +1,3 @@
-import ida_idp
 import hashlib
 import json
 import os
@@ -12,6 +11,7 @@ import ida_bytes
 import ida_funcs
 import ida_ida
 import ida_idaapi
+import ida_idp
 import ida_kernwin
 import ida_nalt
 import ida_name
@@ -178,46 +178,6 @@ def _truncate_filename_name(name, suffix, max_bytes=255):
     # 'ignore' drops any trailing incomplete multi-byte sequence
     return encoded[:budget].decode("utf-8", errors="ignore")
 
-
-# --- Reference Range Scanning ---
-# The code/data range detection helpers below (get_loose_code_block_range,
-# get_loose_data_range, check_func_range, check_c_ref_range, get_ref_from_insn,
-# check_o_ref_range, check_d_ref_range) are taken from the Assemport plugin
-# (AssemportEx/Assemport.py), where they have been correctness-tested.
-
-
-def get_loose_code_block_range(ea):
-    end_ea = ea
-    while True:
-        curr_flags = ida_bytes.get_flags(end_ea)
-        if end_ea == idaapi.BADADDR or not ida_bytes.is_code(curr_flags):
-            break
-        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, True)]
-        if len(refs) == 0:
-            end_ea = ida_bytes.get_item_end(end_ea)
-            break
-        refs = [ref for ref in idautils.CodeRefsFrom(end_ea, False)]
-        if len(refs) > 0:
-            end_ea = ida_bytes.get_item_end(end_ea)
-            break
-        cur_func = ida_funcs.get_func(end_ea)
-        if cur_func:
-            if cur_func.start_ea <= end_ea < cur_func.end_ea:
-                end_ea = cur_func.end_ea
-                break
-            if cur_func.start_ea == end_ea:
-                break
-        cur_fchunk = ida_funcs.get_fchunk(end_ea)
-        if cur_fchunk:
-            if cur_fchunk.start_ea <= end_ea < cur_fchunk.end_ea:
-                end_ea = cur_fchunk.end_ea
-                break
-            if cur_fchunk.start_ea == end_ea:
-                break
-        end_ea = ida_bytes.get_item_end(end_ea)
-    return ida_range.range_t(ea, end_ea)
-
-
 def get_loose_data_range(ea, max_explore_len=0):
     end_ea = ea
     while True:
@@ -234,49 +194,16 @@ def get_loose_data_range(ea, max_explore_len=0):
             break
     return ida_range.range_t(ea, end_ea)
 
-
-def _gap_is_pure_data(gap_start, gap_end):
-    """True if [gap_start, gap_end) is fully mapped and contains no code -- i.e.
-    it is data/undefined bytes (an inline literal pool or jump table) embedded
-    between two code blocks of the same function, as opposed to code belonging
-    to some other function that a far jump skipped over."""
-    ea = gap_start
-    while ea < gap_end:
-        if not ida_bytes.is_mapped(ea):
-            return False
-        if ida_bytes.is_code(ida_bytes.get_flags(ea)):
-            return False
-        nxt = ida_bytes.get_item_end(ea)
-        if nxt <= ea:
-            return False
-        ea = nxt
-    return True
-
-
-def _merge_code_intervals(intervals):
-    """Merge per-instruction intervals into contiguous code runs, then bridge
-    the gap between two adjacent runs ONLY when it is entirely non-code (an
-    embedded literal pool / jump table). Gaps that contain code are left
-    unbridged, so a far `B` that jumps over other functions produces separate
-    ranges instead of one giant span that swallows them."""
+def _merge_code_intervals(intervals:list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge per-instruction intervals into contiguous code runs.leave gaps as it is"""
     if not intervals:
         return []
     intervals.sort()
-    runs = []
+    merged = []
     cs, ce = intervals[0]
     for s, e in intervals[1:]:
         if s <= ce:  # contiguous / overlapping instructions
             ce = max(ce, e)
-        else:
-            runs.append((cs, ce))
-            cs, ce = s, e
-    runs.append((cs, ce))
-
-    merged = []
-    cs, ce = runs[0]
-    for s, e in runs[1:]:
-        if s > ce and _gap_is_pure_data(ce, s):
-            ce = e  # bridge across the embedded-data gap
         else:
             merged.append((cs, ce))
             cs, ce = s, e
@@ -284,7 +211,7 @@ def _merge_code_intervals(intervals):
     return merged
 
 
-def reconstruct_func_range(start_ea):
+def reconstruct_func_range(start_ea) -> list[tuple[int, int]]:
     """Best-effort reconstruction of a function's extent when IDA has NOT
     defined a function at `start_ea` -- e.g. a control-flow-flattened or
     obfuscated routine that has data (jump tables / inline constants) embedded
@@ -294,11 +221,8 @@ def reconstruct_func_range(start_ea):
     and local jump targets, but NOT calls (BL/CALL target other functions) and
     does not cross into a different already-defined function (tail calls).
 
-    Returns a LIST of (start, end) ranges -- the reached code blocks, with
-    embedded pure-data gaps bridged. It deliberately does NOT collapse to a
-    single [lo, hi] span: a far jump (e.g. a tail jump that skips over other
-    functions) leaves a gap containing code, which is not bridged, so unrelated
-    functions in between are never swallowed. Returns [] when nothing decodes."""
+    Returns a LIST of (start, end) ranges -- the reached code blocks, without
+    embedded pure-data gaps bridged."""
     visited = set()
     stack = [start_ea]
     intervals = []
@@ -338,11 +262,11 @@ def reconstruct_func_range(start_ea):
 
 
 def check_func_range(
-    ranges: list,
+    ranges: list[ida_range.range_t],
     ref: int,
     cur_func: ida_funcs.func_t,
-    funcs_to_export: list | None,
-    processed_ranges: set,
+    funcs_to_export: list[int] | None,
+    processed_ranges: set[tuple[int, int]],
 ):
     """check the possible func range(or just a commom code chunk)"""
     func = ida_funcs.get_func(ref)
@@ -356,22 +280,24 @@ def check_func_range(
                 if (ref, func.end_ea) not in processed_ranges and r not in ranges:
                     ranges.append(r)
             else:
-                r = get_loose_code_block_range(ref)
-                if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
-                    ranges.append(r)
+                for s, e in reconstruct_func_range(ref):
+                    r = ida_range.range_t(s, e)
+                    if (s, e) not in processed_ranges and r not in ranges:
+                        ranges.append(r)
     elif not func:
-        r = get_loose_code_block_range(ref)
-        if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
-            ranges.append(r)
+        for s, e in reconstruct_func_range(ref):
+            r = ida_range.range_t(s, e)
+            if (s, e) not in processed_ranges and r not in ranges:
+                ranges.append(r)
 
 
 def check_c_ref_range(
-    ranges: list,
+    ranges: list[ida_range.range_t],
     addr: int,
     cur_range: tuple[int, int],
     cur_func: ida_funcs.func_t,
-    funcs_to_export: list | None,
-    processed_ranges: set,
+    funcs_to_export: list[int] | None,
+    processed_ranges: set[tuple[int, int]],
 ):
     """check code ref at addr"""
     for ref in idautils.XrefsFrom(addr, ida_xref.XREF_FAR):
@@ -409,11 +335,11 @@ def get_ref_from_insn(ea):
 
 
 def check_o_ref_range(
-    ranges: list,
+    ranges: list[ida_range.range_t],
     cur_range: tuple[int, int],
     cur_func: ida_funcs.func_t,
-    funcs_to_export: list | None,
-    processed_ranges: set,
+    funcs_to_export: list[int] | None,
+    processed_ranges: set[tuple[int, int]],
     skip_named_data: bool = False,
     max_explore_len: int = 128,
 ):
@@ -451,11 +377,11 @@ def check_o_ref_range(
 
 
 def check_d_ref_range(
-    ranges: list,
+    ranges: list[ida_range.range_t],
     cur_range: tuple[int, int],
     cur_func: ida_funcs.func_t,
-    funcs_to_export: list | None,
-    processed_ranges: set,
+    funcs_to_export: list[int] | None,
+    processed_ranges: set[tuple[int, int]],
     skip_named_data: bool = False,
     max_explore_len: int = 0,
 ):
@@ -507,7 +433,7 @@ def is_stub_func(func) -> bool:
     return False
 
 
-def get_recursive_functions(start_ea) -> list:
+def get_recursive_functions(start_ea) -> list[int]:
     """Get all functions reachable from start_ea. Library functions and named
     import thunks are included in the result but NOT recursed into; only their
     first instruction is later collected so references to them show the name."""
@@ -756,6 +682,13 @@ class SlicerTable(QtWidgets.QTableWidget):
             ea = int(item.text(), 16)
         except ValueError:
             return
+        # The End value is an exclusive bound, so it often points one past the
+        # last mapped byte (unmapped). Back up to the last mapped address so the
+        # jump lands somewhere valid instead of failing.
+        if not ida_bytes.is_mapped(ea):
+            prev = ida_bytes.prev_addr(ea)
+            if prev != idaapi.BADADDR:
+                ea = prev
         ida_kernwin.jumpto(ea)
 
     def show_context_menu(self, pos):
@@ -1094,21 +1027,21 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             ida_kernwin.action_desc_t(
                 "idaslicer:add_func_recursive",
                 "Add function recursively to slicer",
-                AddToSlicerHandler(self, "function_recursive"),# ty:ignore[too-many-positional-arguments]
+                AddToSlicerHandler(self, "function_recursive"),  # ty:ignore[too-many-positional-arguments]
             )
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
                 "idaslicer:add_sel",
                 "Add selection to slicer",
-                AddToSlicerHandler(self, "selection"),# ty:ignore[too-many-positional-arguments]
+                AddToSlicerHandler(self, "selection"),  # ty:ignore[too-many-positional-arguments]
             )
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
                 "idaslicer:add_seg",
                 "Add current segment to slicer",
-                AddToSlicerHandler(self, "segment"),# ty:ignore[too-many-positional-arguments]
+                AddToSlicerHandler(self, "segment"),  # ty:ignore[too-many-positional-arguments]
             )
         )
 
