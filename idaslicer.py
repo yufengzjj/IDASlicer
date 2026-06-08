@@ -383,7 +383,7 @@ def check_d_ref_range(
     funcs_to_export: list[int] | None,
     processed_ranges: set[tuple[int, int]],
     skip_named_data: bool = False,
-    max_explore_len: int = 0,
+    max_explore_len: int = 128,
 ):
     """check data ref"""
     ea = cur_range[0]
