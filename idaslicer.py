@@ -442,7 +442,7 @@ def get_recursive_functions(start_ea) -> list[int]:
 
     while stack:
         ea = stack.pop(0)
-        func = ida_funcs.get_func(ea)
+        func = ida_funcs.get_func(ea) or _NoFunc(ea)
         if not func:
             continue
 
