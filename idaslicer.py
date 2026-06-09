@@ -178,6 +178,7 @@ def _truncate_filename_name(name, suffix, max_bytes=255):
     # 'ignore' drops any trailing incomplete multi-byte sequence
     return encoded[:budget].decode("utf-8", errors="ignore")
 
+
 def get_loose_data_range(ea, max_explore_len=0):
     end_ea = ea
     while True:
@@ -194,7 +195,8 @@ def get_loose_data_range(ea, max_explore_len=0):
             break
     return ida_range.range_t(ea, end_ea)
 
-def _merge_code_intervals(intervals:list[tuple[int, int]]) -> list[tuple[int, int]]:
+
+def _merge_code_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Merge per-instruction intervals into contiguous code runs.leave gaps as it is"""
     if not intervals:
         return []
@@ -277,17 +279,17 @@ def check_func_range(
         else:
             if func.start_ea <= ref < func.end_ea:
                 r = ida_range.range_t(ref, func.end_ea)
-                if (ref, func.end_ea) not in processed_ranges and r not in ranges:
+                if not _is_range_covered(processed_ranges, s, e):
                     ranges.append(r)
             else:
                 for s, e in reconstruct_func_range(ref):
                     r = ida_range.range_t(s, e)
-                    if (s, e) not in processed_ranges and r not in ranges:
+                    if not _is_range_covered(processed_ranges, s, e):
                         ranges.append(r)
     elif not func:
         for s, e in reconstruct_func_range(ref):
             r = ida_range.range_t(s, e)
-            if (s, e) not in processed_ranges and r not in ranges:
+            if not _is_range_covered(processed_ranges, s, e):
                 ranges.append(r)
 
 
@@ -304,13 +306,9 @@ def check_c_ref_range(
         if cur_range[0] <= ref.to < cur_range[1]:
             continue
         if ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
-            func = ida_funcs.get_func(ref.to)
-            if not func:
-                for s, e in reconstruct_func_range(ref.to):
-                    r = ida_range.range_t(s, e)
-                    if (s, e) not in processed_ranges and r not in ranges:
-                        ranges.append(r)
-                continue
+            if funcs_to_export is not None:
+                funcs_to_export.append(ref.to)
+            continue
         check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges)
 
 
@@ -360,19 +358,19 @@ def check_o_ref_range(
             else:
                 for s, e in reconstruct_func_range(o_ref):
                     r = ida_range.range_t(s, e)
-                    if (s, e) not in processed_ranges and r not in ranges:
+                    if not _is_range_covered(processed_ranges, s, e):
                         ranges.append(r)
         elif ida_bytes.is_data(o_flags):
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
             r = ida_range.range_t(o_ref, o_ref + ida_bytes.get_item_size(o_ref))
-            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+            if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
                 ranges.append(r)
         else:
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
             r = get_loose_data_range(o_ref, max_explore_len)
-            if (r.start_ea, r.end_ea) not in processed_ranges and r not in ranges:
+            if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
                 ranges.append(r)
 
 
@@ -409,14 +407,11 @@ def check_d_ref_range(
                         else:
                             for s, e in reconstruct_func_range(ptr):
                                 r = ida_range.range_t(s, e)
-                                if (s, e) not in processed_ranges and r not in ranges:
+                                if not _is_range_covered(processed_ranges, s, e):
                                     ranges.append(r)
                     elif not (skip_named_data and ida_bytes.has_name(flags)):
                         r = get_loose_data_range(ptr, max_explore_len)
-                        if (
-                            r.start_ea,
-                            r.end_ea,
-                        ) not in processed_ranges and r not in ranges:
+                        if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
                             ranges.append(r)
         ea = next_ea
 
@@ -458,12 +453,12 @@ def get_recursive_functions(start_ea) -> list[int]:
 
         # Find all calls from this function
         for head in idautils.FuncItems(func_ea):
-            for ref in idautils.CodeRefsFrom(head, False):
-                called_func = ida_funcs.get_func(ref)
+            for ref in idautils.XrefsFrom(head, ida_xref.XREF_FAR):
+                called_func = ida_funcs.get_func(ref.to)
                 if called_func and called_func.start_ea != func_ea:
                     stack.append(called_func.start_ea)
-                elif not called_func:
-                    to_export.append(ref)
+                elif not called_func and ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                    to_export.append(ref.to)
 
     return to_export
 
@@ -482,6 +477,15 @@ class _NoFunc:
 _NO_FUNC = _NoFunc()
 
 
+def _is_range_covered(existing, new_start: int, new_end: int) -> bool:
+    """True if any (start, end) pair in `existing` fully covers
+    [new_start, new_end) -- i.e. start <= new_start and new_end <= end."""
+    for s, e in existing:
+        if s <= new_start and new_end <= e:
+            return True
+    return False
+
+
 def _scan_worklist(
     all_ranges: list,
     cur_func,
@@ -498,7 +502,7 @@ def _scan_worklist(
         start, end = r.start_ea, r.end_ea
         if start >= end:
             continue
-        if (start, end) in processed_ranges:
+        if _is_range_covered(processed_ranges, start, end):
             continue
 
         collected.append((start, end))
