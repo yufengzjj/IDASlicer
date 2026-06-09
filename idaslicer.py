@@ -435,10 +435,6 @@ def get_recursive_functions(start_ea) -> list[int]:
 
         to_export.append(func_ea)
 
-        # Don't recurse into library functions / import stubs.
-        if is_stub_func(func):
-            continue
-
         # Find all calls from this function
         for head in idautils.FuncItems(func_ea):
             for ref in idautils.XrefsFrom(head, ida_xref.XREF_FAR):
@@ -551,10 +547,7 @@ def _drain_functions(funcs_to_export: list, collected: list, processed_ranges: s
             continue
         func = ida_funcs.get_func(ea) or _NoFunc(ea)
         processed_funcs.add(func.start_ea)
-        if is_stub_func(func):
-            _collect_stub_range(func, collected, processed_ranges)
-        else:
-            _scan_func_ranges(func, collected, funcs_to_export, processed_ranges)
+        _scan_func_ranges(func, collected, funcs_to_export, processed_ranges)
 
 
 def collect_recursive_ranges(start_ea) -> list:
