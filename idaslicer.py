@@ -352,14 +352,8 @@ def check_o_ref_range(
             continue
         o_flags = ida_bytes.get_flags(o_ref)
         if ida_bytes.is_code(o_flags):
-            func = ida_funcs.get_func(o_ref)
-            if func:
-                check_func_range(ranges, o_ref, cur_func, funcs_to_export, processed_ranges)
-            else:
-                for s, e in reconstruct_func_range(o_ref):
-                    r = ida_range.range_t(s, e)
-                    if not _is_range_covered(processed_ranges, s, e):
-                        ranges.append(r)
+            if funcs_to_export is not None:
+                funcs_to_export.append(o_ref)
         elif ida_bytes.is_data(o_flags):
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
@@ -401,14 +395,8 @@ def check_d_ref_range(
                 ):
                     flags = ida_bytes.get_flags(ptr)
                     if ida_bytes.is_code(flags):
-                        func = ida_funcs.get_func(ptr)
-                        if func:
-                            check_func_range(ranges, ptr, cur_func, funcs_to_export, processed_ranges)
-                        else:
-                            for s, e in reconstruct_func_range(ptr):
-                                r = ida_range.range_t(s, e)
-                                if not _is_range_covered(processed_ranges, s, e):
-                                    ranges.append(r)
+                        if funcs_to_export is not None:
+                            funcs_to_export.append(ptr)
                     elif not (skip_named_data and ida_bytes.has_name(flags)):
                         r = get_loose_data_range(ptr, max_explore_len)
                         if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
