@@ -307,7 +307,7 @@ def check_c_ref_range(
             continue
         if ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
             if funcs_to_export is not None:
-                funcs_to_export.append(ref.to)
+                funcs_to_export.extend(get_recursive_functions(ref.to))
             continue
         check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges)
 
@@ -353,7 +353,7 @@ def check_o_ref_range(
         o_flags = ida_bytes.get_flags(o_ref)
         if ida_bytes.is_code(o_flags):
             if funcs_to_export is not None:
-                funcs_to_export.append(o_ref)
+                funcs_to_export.extend(get_recursive_functions(o_ref))
         elif ida_bytes.is_data(o_flags):
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
@@ -396,7 +396,7 @@ def check_d_ref_range(
                     flags = ida_bytes.get_flags(ptr)
                     if ida_bytes.is_code(flags):
                         if funcs_to_export is not None:
-                            funcs_to_export.append(ptr)
+                            funcs_to_export.extend(get_recursive_functions(ptr))
                     elif not (skip_named_data and ida_bytes.has_name(flags)):
                         r = get_loose_data_range(ptr, max_explore_len)
                         if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
@@ -511,10 +511,13 @@ def _scan_worklist(
 
 def _scan_func_ranges(func, collected: list, funcs_to_export: list, processed_ranges: set):
     """Scan a single function's ranges via the shared worklist driver."""
-    ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
-    if func.end_ea == idaapi.BADADDR:
-        all_ranges = [ida_range.range_t(s, e) for (s, e) in reconstruct_func_range(func.start_ea)]
+    all_ranges = []
+    if func.end_ea == ida_idaapi.BADADDR:
+        for s, e in reconstruct_func_range(func.start_ea):
+            if not _is_range_covered(processed_ranges, s, e):
+                all_ranges.append(ida_range.range_t(s, e))
     else:
+        ranges = ida_range.rangeset_t()  # ty:ignore[missing-argument]
         ida_funcs.get_func_ranges(ranges, func)
         all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
     all_ranges.sort(key=lambda r: (0 if r.start_ea == func.start_ea else 1, r.start_ea))
@@ -575,7 +578,7 @@ def collect_recursive_ranges_from_range(start, end) -> list:
     processed_ranges = set()
     funcs_to_export = []
     collected = []
-    cur_func = ida_funcs.get_func(start) or _NO_FUNC
+    cur_func = ida_funcs.get_func(start) or _NoFunc(start)
     _scan_worklist(
         [ida_range.range_t(start, end)],
         cur_func,
