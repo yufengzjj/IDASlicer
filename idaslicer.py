@@ -98,7 +98,7 @@ if __name__ == "__main__":
 
 
 class SlicerEntry:
-    def __init__(self, name, start, end, perm, seg_type, align, sig="", recursive=False):
+    def __init__(self, name, start, end, perm, seg_type, align, sig="", recursive=False, ref=None):
         self.name = name
         self.start = start
         self.end = end
@@ -108,6 +108,11 @@ class SlicerEntry:
         # True if this range was discovered by a recursive reference scan. Such
         # entries are re-scanned when their range is edited.
         self.recursive = recursive
+        # Address of the instruction or pointer whose reference pulled this range
+        # in, or None when nothing referenced it: a scan seed, a hand-added range,
+        # or an entry saved before this field existed. Provenance only, never read
+        # by the scanner.
+        self.ref = ref
         self.sig = sig
         if not self.sig:
             self.update_sig()
@@ -133,6 +138,7 @@ class SlicerEntry:
             "align": self.align,
             "sig": self.sig,
             "recursive": self.recursive,
+            "ref": self.ref,
         }
 
     @staticmethod
@@ -146,10 +152,42 @@ class SlicerEntry:
             d.get("align", 0),
             d.get("sig", ""),
             d.get("recursive", False),
+            d.get("ref"),
         )
 
     def size(self):
         return self.end - self.start
+
+
+def _record_origin(origins: dict, addr: int, ref_from: int | None):
+    """Note that `addr` was pulled into the scan by the reference at `ref_from`.
+
+    `origins` maps a discovered start address to the address that referenced it.
+    It is provenance only: the scanner never reads it back, so it cannot affect
+    which ranges are collected or when the worklists terminate.
+
+    First discovery wins -- an address is usually reachable from several places,
+    and the reference that actually pulled it in is the informative one. The None
+    guard is not cosmetic: setdefault(addr, None) would plant a key and lock out
+    the real referrer found later."""
+    if ref_from is None:
+        return
+    origins.setdefault(addr, ref_from)
+
+
+def _ref_label(ea: int | None) -> str:
+    """Render a referrer address for the Ref column: an address, plus where it
+    sits if that can be said more usefully than a bare number."""
+    if ea is None:
+        return ""
+    func = ida_funcs.get_func(ea)
+    if func:
+        name = ida_funcs.get_func_name(func.start_ea)
+        off = ea - func.start_ea
+        if name:
+            return f"{hex(ea)} ({name}+{hex(off)})" if off else f"{hex(ea)} ({name})"
+    name = ida_name.get_name(ea)
+    return f"{hex(ea)} ({name})" if name else hex(ea)
 
 
 def get_seg_class(seg_type):
@@ -179,13 +217,47 @@ def _truncate_filename_name(name, suffix, max_bytes=255):
     return encoded[:budget].decode("utf-8", errors="ignore")
 
 
+# Scanner tuning, edited via the panel's Settings button and persisted globally
+# (not under the md5-keyed entries) in idaslicer_config.json.
+#
+# Module-level rather than plugin attributes because the scanner is a tree of
+# free functions that never receives the plugin instance -- threading these
+# through collect_recursive_ranges -> _drain_functions -> _scan_worklist ->
+# check_* would touch a dozen signatures to deliver two values.
+DEFAULT_SETTINGS = {
+    "max_explore_len": 128,
+    "skip_named_data": False,
+}
+SETTINGS = dict(DEFAULT_SETTINGS)
+
+
+def _apply_stored_settings(stored):
+    """Copy validated values out of a loaded config into SETTINGS.
+
+    Validated rather than trusted: idaslicer_config.json is hand-editable, and a
+    bad type here would not surface until it blew up deep inside a scan. The
+    bool check on max_explore_len is not redundant -- bool is an int subclass, so
+    a JSON `true` would otherwise sail through as a length."""
+    if not isinstance(stored, dict):
+        return
+    val = stored.get("max_explore_len")
+    if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+        SETTINGS["max_explore_len"] = val
+    val = stored.get("skip_named_data")
+    if isinstance(val, bool):
+        SETTINGS["skip_named_data"] = val
+
+
 def get_loose_data_range(ea, max_explore_len=0):
     end_ea = ea
+    seg = ida_segment.getseg(ea)
+    if seg and seg.type == ida_segment.SEG_BSS:
+        end_ea = ida_bytes.get_item_end(ea)
+        return ida_range.range_t(ea, end_ea)
     while True:
         if end_ea == idaapi.BADADDR or not ida_bytes.is_mapped(end_ea):
             break
-        name = ida_name.get_name(end_ea)
-        if end_ea != ea and name:
+        if end_ea != ea and ida_name.get_name(end_ea):
             break
         next_ea = ida_bytes.get_item_end(end_ea)
         if next_ea <= end_ea or next_ea == idaapi.BADADDR:
@@ -269,27 +341,37 @@ def check_func_range(
     cur_func: ida_funcs.func_t,
     funcs_to_export: list[int] | None,
     processed_ranges: set[tuple[int, int]],
+    origins: dict,
+    ref_from: int | None = None,
 ):
-    """check the possible func range(or just a commom code chunk)"""
+    """check the possible func range(or just a commom code chunk)
+
+    `ref_from` is the address whose reference reached `ref`, recorded as the
+    provenance of every range this adds. The reconstructed blocks all inherit it:
+    only the block holding `ref` is reached by the reference itself, but the rest
+    come in as a consequence of it, which is what the Ref column reports."""
     func = ida_funcs.get_func(ref)
     if func and func.start_ea != cur_func.start_ea:
         if ref == func.start_ea:
             if funcs_to_export is not None:
-                funcs_to_export.extend(get_recursive_functions(func.start_ea))
+                funcs_to_export.extend(get_recursive_functions(func.start_ea, origins, ref_from))
         else:
             if func.start_ea <= ref < func.end_ea:
                 r = ida_range.range_t(ref, func.end_ea)
                 if not _is_range_covered(processed_ranges, ref, func.end_ea):
+                    _record_origin(origins, ref, ref_from)
                     ranges.append(r)
             else:
                 for s, e in reconstruct_func_range(ref):
                     r = ida_range.range_t(s, e)
                     if not _is_range_covered(processed_ranges, s, e):
+                        _record_origin(origins, s, ref_from)
                         ranges.append(r)
     elif not func:
         for s, e in reconstruct_func_range(ref):
             r = ida_range.range_t(s, e)
             if not _is_range_covered(processed_ranges, s, e):
+                _record_origin(origins, s, ref_from)
                 ranges.append(r)
 
 
@@ -300,6 +382,7 @@ def check_c_ref_range(
     cur_func: ida_funcs.func_t,
     funcs_to_export: list[int] | None,
     processed_ranges: set[tuple[int, int]],
+    origins: dict,
 ):
     """check code ref at addr"""
     for ref in idautils.XrefsFrom(addr, ida_xref.XREF_FAR):
@@ -307,9 +390,9 @@ def check_c_ref_range(
             continue
         if ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
             if funcs_to_export is not None:
-                funcs_to_export.extend(get_recursive_functions(ref.to))
+                funcs_to_export.extend(get_recursive_functions(ref.to, origins, addr))
             continue
-        check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges)
+        check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges, origins, addr)
 
 
 def get_ref_from_insn(ea):
@@ -338,10 +421,18 @@ def check_o_ref_range(
     cur_func: ida_funcs.func_t,
     funcs_to_export: list[int] | None,
     processed_ranges: set[tuple[int, int]],
-    skip_named_data: bool = False,
-    max_explore_len: int = 128,
+    origins: dict,
+    skip_named_data: bool | None = None,
+    max_explore_len: int | None = None,
 ):
     """check code opraand ref in cur_range"""
+    # None means "whatever the panel is set to". Resolved here rather than in the
+    # signature because default arguments are bound once at import, which would
+    # freeze the setting at its startup value.
+    if skip_named_data is None:
+        skip_named_data = SETTINGS["skip_named_data"]
+    if max_explore_len is None:
+        max_explore_len = SETTINGS["max_explore_len"]
     for head in idautils.Heads(*cur_range):
         o_ref = get_ref_from_insn(head)
         if o_ref is None:
@@ -353,18 +444,24 @@ def check_o_ref_range(
         o_flags = ida_bytes.get_flags(o_ref)
         if ida_bytes.is_code(o_flags):
             if funcs_to_export is not None:
-                funcs_to_export.extend(get_recursive_functions(o_ref))
+                funcs_to_export.extend(get_recursive_functions(o_ref, origins, head))
         elif ida_bytes.is_data(o_flags):
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
-            r = ida_range.range_t(o_ref, o_ref + ida_bytes.get_item_size(o_ref))
+            o_size = ida_bytes.get_item_size(o_ref)
+            if o_size <= 1:
+                r = get_loose_data_range(o_ref, max_explore_len)
+            else:
+                r = ida_range.range_t(o_ref, o_ref + o_size)
             if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
+                _record_origin(origins, r.start_ea, head)
                 ranges.append(r)
         else:
             if skip_named_data and ida_bytes.has_name(o_flags):
                 continue
             r = get_loose_data_range(o_ref, max_explore_len)
             if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
+                _record_origin(origins, r.start_ea, head)
                 ranges.append(r)
 
 
@@ -374,10 +471,15 @@ def check_d_ref_range(
     cur_func: ida_funcs.func_t,
     funcs_to_export: list[int] | None,
     processed_ranges: set[tuple[int, int]],
-    skip_named_data: bool = False,
-    max_explore_len: int = 128,
+    origins: dict,
+    skip_named_data: bool | None = None,
+    max_explore_len: int | None = None,
 ):
     """check data ref"""
+    if skip_named_data is None:
+        skip_named_data = SETTINGS["skip_named_data"]
+    if max_explore_len is None:
+        max_explore_len = SETTINGS["max_explore_len"]
     ea = cur_range[0]
     ptr_size = ida_ida.inf_get_app_bitness() // 8
     while ea < cur_range[1]:
@@ -394,12 +496,19 @@ def check_d_ref_range(
                     # and ida_segment.segtype(ptr) != ida_segment.SEG_XTRN
                 ):
                     flags = ida_bytes.get_flags(ptr)
+                    # The referrer is `ea`, the address the pointer was read from,
+                    # not the item it points at.
                     if ida_bytes.is_code(flags):
                         if funcs_to_export is not None:
-                            funcs_to_export.extend(get_recursive_functions(ptr))
+                            funcs_to_export.extend(get_recursive_functions(ptr, origins, ea))
                     elif not (skip_named_data and ida_bytes.has_name(flags)):
-                        r = get_loose_data_range(ptr, max_explore_len)
+                        d_size = ida_bytes.get_item_size(ptr)
+                        if d_size <= 1:
+                            r = get_loose_data_range(ptr, max_explore_len)
+                        else:
+                            r = ida_range.range_t(ptr, ptr + d_size)
                         if not _is_range_covered(processed_ranges, r.start_ea, r.end_ea):
+                            _record_origin(origins, r.start_ea, ea)
                             ranges.append(r)
         ea = next_ea
 
@@ -416,12 +525,17 @@ def is_stub_func(func) -> bool:
     return False
 
 
-def get_recursive_functions(start_ea) -> list[int]:
+def get_recursive_functions(start_ea, origins: dict, ref_from: int | None = None) -> list[int]:
     """Get all functions reachable from start_ea. Library functions and named
     import thunks are included in the result but NOT recursed into; only their
-    first instruction is later collected so references to them show the name."""
+    first instruction is later collected so references to them show the name.
+
+    Records each function's referrer into `origins` as it goes: the call graph is
+    walked here, so this is the only place that knows which instruction reached a
+    given callee. `ref_from` is the referrer of `start_ea` itself (None at a seed)."""
     to_export = list()
     stack = [start_ea]
+    _record_origin(origins, start_ea, ref_from)
 
     while stack:
         ea = stack.pop(0)
@@ -440,8 +554,10 @@ def get_recursive_functions(start_ea) -> list[int]:
             for ref in idautils.XrefsFrom(head, ida_xref.XREF_FAR):
                 called_func = ida_funcs.get_func(ref.to)
                 if called_func and called_func.start_ea != func_ea:
+                    _record_origin(origins, called_func.start_ea, head)
                     stack.append(called_func.start_ea)
                 elif not called_func and ref.type in (ida_xref.fl_CN, ida_xref.fl_CF):
+                    _record_origin(origins, ref.to, head)
                     to_export.append(ref.to)
 
     return to_export
@@ -476,11 +592,15 @@ def _scan_worklist(
     collected: list,
     funcs_to_export: list,
     processed_ranges: set,
+    origins: dict,
 ):
     """Drain a worklist of ranges, recording each into `collected` and appending
     newly discovered code/data ranges (back onto `all_ranges`) and referenced
     functions (onto `funcs_to_export`). `cur_func` is the function the seed
-    ranges belong to (or `_NO_FUNC` for loose ranges)."""
+    ranges belong to (or `_NO_FUNC` for loose ranges).
+
+    `origins` is filled in by the check_* helpers as they discover ranges; it is
+    write-only here, so provenance cannot influence what gets collected."""
     while len(all_ranges) > 0:
         r = all_ranges.pop(0)
         start, end = r.start_ea, r.end_ea
@@ -494,18 +614,18 @@ def _scan_worklist(
         flags = ida_bytes.get_flags(start)
         if ida_bytes.is_code(flags):
             if start >= cur_func.start_ea and end <= cur_func.end_ea and cur_func.end_ea != idaapi.BADADDR:
-                check_c_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), cur_func, funcs_to_export, processed_ranges)
+                check_c_ref_range(all_ranges, ida_bytes.prev_head(end, start), (start, end), cur_func, funcs_to_export, processed_ranges, origins)
             else:
                 for head in idautils.Heads(start, end):
-                    check_c_ref_range(all_ranges, head, (start, end), cur_func, funcs_to_export, processed_ranges)
-            check_o_ref_range(all_ranges, (start, end), cur_func, funcs_to_export, processed_ranges)
+                    check_c_ref_range(all_ranges, head, (start, end), cur_func, funcs_to_export, processed_ranges, origins)
+            check_o_ref_range(all_ranges, (start, end), cur_func, funcs_to_export, processed_ranges, origins)
         else:
-            check_d_ref_range(all_ranges, (start, end), cur_func, funcs_to_export, processed_ranges)
+            check_d_ref_range(all_ranges, (start, end), cur_func, funcs_to_export, processed_ranges, origins)
 
         processed_ranges.add((start, end))
 
 
-def _scan_func_ranges(func, collected: list, funcs_to_export: list, processed_ranges: set):
+def _scan_func_ranges(func, collected: list, funcs_to_export: list, processed_ranges: set, origins: dict):
     """Scan a single function's ranges via the shared worklist driver."""
     all_ranges = []
     if func.end_ea == ida_idaapi.BADADDR:
@@ -517,7 +637,14 @@ def _scan_func_ranges(func, collected: list, funcs_to_export: list, processed_ra
         ida_funcs.get_func_ranges(ranges, func)
         all_ranges = [ranges.getrange(i) for i in range(ranges.nranges())]
     all_ranges.sort(key=lambda r: (0 if r.start_ea == func.start_ea else 1, r.start_ea))
-    _scan_worklist(all_ranges, func, collected, funcs_to_export, processed_ranges)
+    # These chunks come from IDA's function extents, not from a reference, so no
+    # check_* helper recorded them. Attribute them to whatever referenced the
+    # function -- already in `origins` from the call-graph walk, and absent for a
+    # seed. The chunk starting at func.start_ea keeps its own entry either way.
+    seed_ref = origins.get(func.start_ea)
+    for r in all_ranges:
+        _record_origin(origins, r.start_ea, seed_ref)
+    _scan_worklist(all_ranges, func, collected, funcs_to_export, processed_ranges, origins)
 
 
 def _collect_stub_range(func, collected: list, processed_ranges: set):
@@ -534,7 +661,7 @@ def _collect_stub_range(func, collected: list, processed_ranges: set):
     processed_ranges.add((start, end))
 
 
-def _drain_functions(funcs_to_export: list, collected: list, processed_ranges: set):
+def _drain_functions(funcs_to_export: list, collected: list, processed_ranges: set, origins: dict):
     """Process every function on the worklist (which grows as references are
     discovered). Regular functions are scanned in full; library functions and
     named import thunks contribute only their first instruction."""
@@ -547,27 +674,38 @@ def _drain_functions(funcs_to_export: list, collected: list, processed_ranges: s
             continue
         func = ida_funcs.get_func(ea) or _NoFunc(ea)
         processed_funcs.add(func.start_ea)
-        _scan_func_ranges(func, collected, funcs_to_export, processed_ranges)
+        _scan_func_ranges(func, collected, funcs_to_export, processed_ranges, origins)
 
 
-def collect_recursive_ranges(start_ea) -> list:
+# The three collectors below take `origins` as a caller-owned dict rather than
+# returning it, so their (start, end) return value stays what every caller
+# already expects. Pass {} when the provenance is not wanted.
+
+
+def collect_recursive_ranges(start_ea, origins: dict | None = None) -> list:
     """Collect the range of the function at `start_ea` plus all code/data ranges
     it references, recursively following the discovered functions/ranges.
 
-    Returns a list of (start_ea, end_ea) tuples."""
-    funcs_to_export = get_recursive_functions(start_ea)
+    Returns a list of (start_ea, end_ea) tuples. `origins`, if given, is filled
+    with {discovered start: referring address}; `start_ea` is the seed and so
+    never appears in it."""
+    if origins is None:
+        origins = {}
+    funcs_to_export = get_recursive_functions(start_ea, origins)
     processed_ranges = set()
     collected = []
-    _drain_functions(funcs_to_export, collected, processed_ranges)
+    _drain_functions(funcs_to_export, collected, processed_ranges, origins)
     return collected
 
 
-def collect_recursive_ranges_from_range(start, end) -> list:
+def collect_recursive_ranges_from_range(start, end, origins: dict | None = None) -> list:
     """Like `collect_recursive_ranges`, but seeded from an arbitrary range
     instead of a function. Used when an existing range is edited: the new range
     is scanned for references and everything reachable is collected.
 
     The seed range itself is included in the result."""
+    if origins is None:
+        origins = {}
     processed_ranges = set()
     funcs_to_export = []
     collected = []
@@ -578,27 +716,51 @@ def collect_recursive_ranges_from_range(start, end) -> list:
         collected,
         funcs_to_export,
         processed_ranges,
+        origins,
     )
-    _drain_functions(funcs_to_export, collected, processed_ranges)
+    _drain_functions(funcs_to_export, collected, processed_ranges, origins)
     return collected
 
 
-def collect_recursive_ranges_from_ranges(seed_ranges) -> list:
+def collect_recursive_ranges_from_ranges(seed_ranges, origins: dict | None = None) -> list:
     """Like `collect_recursive_ranges_from_range`, but seeded from several loose
     ranges at once (e.g. the blocks returned by `reconstruct_func_range` for a
     function IDA never defined). The seeds are treated as not belonging to any
     function (`_NO_FUNC`); each is scanned for references and everything
     reachable is collected. The seed ranges themselves are included."""
+    if origins is None:
+        origins = {}
     processed_ranges = set()
     funcs_to_export = []
     collected = []
     seeds = [ida_range.range_t(s, e) for s, e in seed_ranges if s < e]
-    _scan_worklist(seeds, _NO_FUNC, collected, funcs_to_export, processed_ranges)
-    _drain_functions(funcs_to_export, collected, processed_ranges)
+    _scan_worklist(seeds, _NO_FUNC, collected, funcs_to_export, processed_ranges, origins)
+    _drain_functions(funcs_to_export, collected, processed_ranges, origins)
     return collected
 
 
 # --- UI Components ---
+
+
+def _qt_flags(*flags):
+    """OR Qt flags together without tripping IDA's PyQt5 shim.
+
+    When something in the session imports PyQt5, IDA's shim (PyQt5/utils.py)
+    replaces __or__ on every PySide6 enum that is not already an IntEnum/IntFlag.
+    The replacement warns (RuntimeWarning) even when both operands are the same
+    enum type, so a plain `A | B` is enough to trigger it. Despite the name of
+    the shim's warn_once_per_module(), the dedupe is Python's default filter,
+    which keys on source line -- so every OR site reports separately.
+
+    Only enums whose base is Flag need this. Checked against IDA 9.3's bundled
+    PySide6 6.8.0: QDialogButtonBox.StandardButton and
+    QAbstractItemView.EditTrigger are Flag and do need it, while
+    QMessageBox.StandardButton is an IntFlag and ORs natively without warning.
+    Only __or__ is patched, so `&` and `~` on Qt flags are fine either way."""
+    combined = 0
+    for f in flags:
+        combined |= f.value
+    return type(flags[0])(combined)
 
 
 class _SizeItem(QtWidgets.QTableWidgetItem):
@@ -619,22 +781,20 @@ class _SizeItem(QtWidgets.QTableWidgetItem):
 
 
 class SlicerTable(QtWidgets.QTableWidget):
-    COL_NAME, COL_START, COL_END, COL_SIZE, COL_ATTRS, COL_SIG = range(6)
+    COL_NAME, COL_START, COL_END, COL_SIZE, COL_REF, COL_ATTRS, COL_SIG = range(7)
 
     def __init__(self, plugin, parent=None):
         super(SlicerTable, self).__init__(parent)
         self.plugin = plugin
         self._filter_text = ""
-        self.setColumnCount(6)
-        self.setHorizontalHeaderLabels(["Name", "Start", "End", "Size", "Attributes", "Sig"])
+        self.setColumnCount(7)
+        self.setHorizontalHeaderLabels(["Name", "Start", "End", "Size", "Ref", "Attributes", "Sig"])
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         # Deliberately without AnyKeyPressed: Delete on a selected row deletes
         # entries (see keyPressEvent), so stray typing must not open an editor.
-        self.setEditTriggers(
-            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
-        )
+        self.setEditTriggers(_qt_flags(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked, QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed))
         self._pending_jump = None
         self._jump_timer = QtCore.QTimer(self)
         self._jump_timer.setSingleShot(True)
@@ -675,11 +835,18 @@ class SlicerTable(QtWidgets.QTableWidget):
                 if entry.recursive:
                     attr_str += " | rec"
 
-                # Attributes is a composite rendering and Sig is derived from the
-                # bytes; neither round-trips through a text editor, so both stay
-                # read-only and keep going through the Edit dialog.
-                for col, text in ((self.COL_ATTRS, attr_str), (self.COL_SIG, entry.sig)):
-                    item = QtWidgets.QTableWidgetItem(text)
+                # Ref records where the scan found this range and means nothing
+                # if retyped; Attributes is a composite rendering; Sig is derived
+                # from the bytes. None round-trips through a text editor, so all
+                # three stay read-only.
+                ref_item = QtWidgets.QTableWidgetItem(_ref_label(entry.ref))
+                if entry.ref is not None:
+                    ref_item.setToolTip("Click to jump to the reference that pulled this range in.")
+                for col, item in (
+                    (self.COL_REF, ref_item),
+                    (self.COL_ATTRS, QtWidgets.QTableWidgetItem(attr_str)),
+                    (self.COL_SIG, QtWidgets.QTableWidgetItem(entry.sig)),
+                ):
                     item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
                     self.setItem(i, col, item)
         finally:
@@ -755,22 +922,23 @@ class SlicerTable(QtWidgets.QTableWidget):
             self.setRowHidden(row, not hit)
 
     def on_cell_clicked(self, row, col):
-        """Clicking the Start or End cell jumps the IDA view to that address.
+        """Clicking the Start, End or Ref cell jumps the IDA view to that address.
 
         Qt delivers the first click of a double click as an ordinary click, so
         jumping right here would navigate away every time the user double clicks
         the cell to edit it. Hold the jump for the double-click interval instead;
         `on_cell_double_clicked` cancels it if the second click arrives. The cost
-        is that a real single click navigates that much later."""
-        if col not in (self.COL_START, self.COL_END):
+        is that a real single click navigates that much later.
+
+        The address comes off the entry rather than the cell text: Ref renders as
+        "0x1234 (sub_1000+0x8)", which no int() parse would survive."""
+        if row >= len(self.entries):
             return
-        item = self.item(row, col)
-        if item is None:
+        entry = self.entries[row]
+        ea = {self.COL_START: entry.start, self.COL_END: entry.end, self.COL_REF: entry.ref}.get(col)
+        if ea is None:
             return
-        try:
-            self._pending_jump = int(item.text(), 16)
-        except ValueError:
-            return
+        self._pending_jump = ea
         self._jump_timer.start(QtWidgets.QApplication.doubleClickInterval())
 
     def on_cell_double_clicked(self, row, col):
@@ -902,7 +1070,9 @@ class SlicerTable(QtWidgets.QTableWidget):
         layout.addRow("Alignment (int):", align_edit)
         layout.addRow("Recursive:", recursive_check)
 
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons = QtWidgets.QDialogButtonBox(
+            _qt_flags(QtWidgets.QDialogButtonBox.StandardButton.Ok, QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        )
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addRow(buttons)
@@ -931,6 +1101,65 @@ class SlicerTable(QtWidgets.QTableWidget):
                 self.plugin.rescan_range_entry(entry)
 
 
+class SettingsDialog(QtWidgets.QDialog):
+    """Scanner tuning, kept out of the entry Edit dialog because these apply to
+    the scan itself rather than to any one range."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("IDASlicer Settings")
+        layout = QtWidgets.QFormLayout(self)
+
+        self.explore_spin = QtWidgets.QSpinBox()
+        self.explore_spin.setRange(0, 0x100000)
+        self.explore_spin.setSuffix(" bytes")
+        self.explore_spin.setValue(SETTINGS["max_explore_len"])
+        self.explore_spin.setToolTip(
+            "When a reference lands on data whose extent IDA has not defined, adjacent\n"
+            "unnamed items are glued together until the span reaches this length. It is\n"
+            "a threshold, not a hard cap: the item that crosses the line is taken whole,\n"
+            "so a range can end past it. The walk also stops early at a named address,\n"
+            "at unmapped memory, or at the end of a BSS item.\n"
+            "\n"
+            "0 takes only the item at the target address.\n"
+            "Raise it when referenced blobs come out truncated; lower it when scans\n"
+            "swallow neighbouring data."
+        )
+
+        self.skip_named_check = QtWidgets.QCheckBox("Skip data that already has a name")
+        self.skip_named_check.setChecked(SETTINGS["skip_named_data"])
+        self.skip_named_check.setToolTip(
+            "Do not pull in referenced data that carries a name. Shrinks a slice by\n"
+            "leaving named globals out, at the cost of references to them landing on\n"
+            "addresses the slice does not contain."
+        )
+
+        layout.addRow("Loose data explore length:", self.explore_spin)
+        layout.addRow("", self.skip_named_check)
+
+        hint = QtWidgets.QLabel("Applies to later scans. Entries already in the list keep the ranges they were collected with.")
+        hint.setWordWrap(True)
+        hint.setEnabled(False)
+        layout.addRow(hint)
+
+        standard = QtWidgets.QDialogButtonBox.StandardButton
+        buttons = QtWidgets.QDialogButtonBox(_qt_flags(standard.Ok, standard.Cancel, standard.RestoreDefaults))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(standard.RestoreDefaults).clicked.connect(self.restore_defaults)
+        layout.addRow(buttons)
+
+    def restore_defaults(self):
+        self.explore_spin.setValue(DEFAULT_SETTINGS["max_explore_len"])
+        self.skip_named_check.setChecked(DEFAULT_SETTINGS["skip_named_data"])
+
+    def values(self):
+        return {
+            "max_explore_len": self.explore_spin.value(),
+            "skip_named_data": self.skip_named_check.isChecked(),
+        }
+
+
 class SlicerPluginForm(ida_kernwin.PluginForm):
     def __init__(self, plugin):
         super(SlicerPluginForm, self).__init__()
@@ -946,6 +1175,9 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.search_edit.setPlaceholderText("Filter rows by any field...")
         self.search_edit.setClearButtonEnabled(True)
         search_layout.addWidget(self.search_edit)
+        self.settings_button = QtWidgets.QPushButton("Settings")
+        self.settings_button.clicked.connect(self.on_settings_clicked)
+        search_layout.addWidget(self.settings_button)
         self.layout.addLayout(search_layout)
 
         self.table = SlicerTable(self.plugin)
@@ -974,6 +1206,12 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.import_seg_button = QtWidgets.QPushButton("Import .seg files")
         self.import_seg_button.clicked.connect(self.on_import_seg_clicked)
         self.layout.addWidget(self.import_seg_button)
+
+    def on_settings_clicked(self):
+        dialog = SettingsDialog(self.parent)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            SETTINGS.update(dialog.values())
+            self.plugin.save_config()
 
     def OnClose(self, form):
         # IDA destroys the Qt widgets when the form closes, but this Python
@@ -1036,10 +1274,14 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
             ea = ctx.cur_ea
             func = ida_funcs.get_func(ea)
             blocks = []
+            # Non-recursive mode still reaches referenced data through
+            # check_o_ref_range, so those blocks do have a referrer worth showing.
+            # The function's own chunks have none, and stay blank.
+            origins = {}
             if func:
                 funcs_to_export = [func.start_ea]
                 processed_ranges = set()
-                _drain_functions(funcs_to_export, blocks, processed_ranges)
+                _drain_functions(funcs_to_export, blocks, processed_ranges, origins)
             else:
                 # No IDA function: reconstruct the full extent (code blocks +
                 # embedded data) by flooding control flow. This may yield several
@@ -1053,7 +1295,7 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
                 bseg = ida_segment.getseg(s)
                 if not bseg:
                     continue
-                self.plugin.add_to_list(SlicerEntry(self.plugin._range_name(s, bseg), s, e, bseg.perm, bseg.type, bseg.align))
+                self.plugin.add_to_list(SlicerEntry(self.plugin._range_name(s, bseg), s, e, bseg.perm, bseg.type, bseg.align, ref=origins.get(s)))
             return 1
         elif self.mode == "segment":
             ea = ctx.cur_ea
@@ -1126,6 +1368,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 config = json.load(f)
 
             self.last_import_path = config.get("last_import_path", "")
+            _apply_stored_settings(config.get("settings"))
 
             md5 = ida_nalt.retrieve_input_file_md5()
             if md5:
@@ -1140,7 +1383,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
     def save_config(self):
         path = self._get_config_path()
-        config = {"entries": {}, "last_import_path": self.last_import_path}
+        config = {"entries": {}, "last_import_path": self.last_import_path, "settings": dict(SETTINGS)}
 
         # Load existing config to preserve other MD5s
         if os.path.exists(path):
@@ -1151,6 +1394,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 pass
 
         config["last_import_path"] = self.last_import_path
+        config["settings"] = dict(SETTINGS)
 
         md5 = ida_nalt.retrieve_input_file_md5()
         if md5:
@@ -1252,11 +1496,14 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             base = ida_segment.get_segm_name(seg)
         return f"{base}_{hex(start)}"
 
-    def _add_collected_ranges(self, ranges):
+    def _add_collected_ranges(self, ranges, origins=None):
         """Turn collected (start, end) ranges into recursive SlicerEntries,
         dropping exact duplicates and ranges fully contained in an existing
         entry or in a larger range from this same batch. Returns the count
-        added (does not save/refresh — the caller does)."""
+        added (does not save/refresh — the caller does).
+
+        `origins` supplies each range's referring address for the Ref column."""
+        origins = origins or {}
         existing = [(e.start, e.end) for e in self.entries]
         existing_set = set(existing)
 
@@ -1289,7 +1536,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             if not seg:
                 continue
             name = self._range_name(start, seg)
-            entry = SlicerEntry(name, start, end, seg.perm, seg.type, seg.align, recursive=True)
+            entry = SlicerEntry(name, start, end, seg.perm, seg.type, seg.align, recursive=True, ref=origins.get(start))
             self.entries.append(entry)
             added += 1
         return added
@@ -1298,8 +1545,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         """Add the function at start_ea and every code/data range it references
         (recursively) to the slicer list."""
         ida_kernwin.show_wait_box("Scanning recursive references...")
+        origins = {}
         try:
-            ranges = collect_recursive_ranges(start_ea)
+            ranges = collect_recursive_ranges(start_ea, origins)
         except Exception as e:
             ida_kernwin.hide_wait_box()
             print(f"[IDASlicer] Recursive scan failed: {e}")
@@ -1308,7 +1556,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         finally:
             ida_kernwin.hide_wait_box()
 
-        added = self._add_collected_ranges(ranges)
+        added = self._add_collected_ranges(ranges, origins)
         self.save_config()
         if self.form:
             self.form.table.refresh()
@@ -1321,8 +1569,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         instead of an IDA-defined function. Used when IDA has not turned the
         code into a function (see `reconstruct_func_range`)."""
         ida_kernwin.show_wait_box("Scanning recursive references...")
+        origins = {}
         try:
-            ranges = collect_recursive_ranges_from_ranges(seed_ranges)
+            ranges = collect_recursive_ranges_from_ranges(seed_ranges, origins)
         except Exception as e:
             ida_kernwin.hide_wait_box()
             print(f"[IDASlicer] Recursive scan failed: {e}")
@@ -1331,7 +1580,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         finally:
             ida_kernwin.hide_wait_box()
 
-        added = self._add_collected_ranges(ranges)
+        added = self._add_collected_ranges(ranges, origins)
         self.save_config()
         if self.form:
             self.form.table.refresh()
@@ -1344,8 +1593,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         """Re-scan an edited recursive entry's range for references and add any
         newly discovered ranges to the slicer list."""
         ida_kernwin.show_wait_box("Re-scanning edited range...")
+        origins = {}
         try:
-            ranges = collect_recursive_ranges_from_range(entry.start, entry.end)
+            ranges = collect_recursive_ranges_from_range(entry.start, entry.end, origins)
         except Exception as e:
             ida_kernwin.hide_wait_box()
             print(f"[IDASlicer] Re-scan failed: {e}")
@@ -1354,7 +1604,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         finally:
             ida_kernwin.hide_wait_box()
 
-        added = self._add_collected_ranges(ranges)
+        added = self._add_collected_ranges(ranges, origins)
         self.save_config()
         if self.form:
             self.form.table.refresh()
