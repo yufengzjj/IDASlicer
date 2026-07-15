@@ -279,7 +279,7 @@ def check_func_range(
         else:
             if func.start_ea <= ref < func.end_ea:
                 r = ida_range.range_t(ref, func.end_ea)
-                if not _is_range_covered(processed_ranges, s, e):
+                if not _is_range_covered(processed_ranges, ref, func.end_ea):
                     ranges.append(r)
             else:
                 for s, e in reconstruct_func_range(ref):
@@ -601,7 +601,26 @@ def collect_recursive_ranges_from_ranges(seed_ranges) -> list:
 # --- UI Components ---
 
 
+class _SizeItem(QtWidgets.QTableWidgetItem):
+    """Size cell: shows "0x64 (100)" but hands the editor just "0x64".
+
+    QTableWidgetItem aliases DisplayRole onto EditRole, so without this override
+    an inline edit would start with the whole composite string for the user to
+    clear and retype."""
+
+    def __init__(self, size):
+        super().__init__(f"{hex(size)} ({size})")
+        self._edit_text = hex(size)
+
+    def data(self, role):
+        if role == QtCore.Qt.ItemDataRole.EditRole:
+            return self._edit_text
+        return super().data(role)
+
+
 class SlicerTable(QtWidgets.QTableWidget):
+    COL_NAME, COL_START, COL_END, COL_SIZE, COL_ATTRS, COL_SIG = range(6)
+
     def __init__(self, plugin, parent=None):
         super(SlicerTable, self).__init__(parent)
         self.plugin = plugin
@@ -611,8 +630,19 @@ class SlicerTable(QtWidgets.QTableWidget):
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        # Deliberately without AnyKeyPressed: Delete on a selected row deletes
+        # entries (see keyPressEvent), so stray typing must not open an editor.
+        self.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked | QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed
+        )
+        self._pending_jump = None
+        self._jump_timer = QtCore.QTimer(self)
+        self._jump_timer.setSingleShot(True)
+        self._jump_timer.timeout.connect(self._do_pending_jump)
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.cellClicked.connect(self.on_cell_clicked)
+        self.cellDoubleClicked.connect(self.on_cell_double_clicked)
+        self.itemChanged.connect(self.on_item_changed)
 
     @property
     def entries(self):
@@ -624,26 +654,91 @@ class SlicerTable(QtWidgets.QTableWidget):
         self.plugin.save_config()
 
     def refresh(self):
-        self.setRowCount(0)
-        for i, entry in enumerate(self.entries):
-            self.insertRow(i)
-            self.setItem(i, 0, QtWidgets.QTableWidgetItem(entry.name))
-            self.setItem(i, 1, QtWidgets.QTableWidgetItem(hex(entry.start)))
-            self.setItem(i, 2, QtWidgets.QTableWidgetItem(hex(entry.end)))
+        # setItem emits itemChanged, so rebuilding the table would otherwise
+        # feed every display string back through on_item_changed as if the user
+        # had typed it.
+        self.blockSignals(True)
+        try:
+            self.setRowCount(0)
+            for i, entry in enumerate(self.entries):
+                self.insertRow(i)
+                self.setItem(i, self.COL_NAME, QtWidgets.QTableWidgetItem(entry.name))
+                self.setItem(i, self.COL_START, QtWidgets.QTableWidgetItem(hex(entry.start)))
+                self.setItem(i, self.COL_END, QtWidgets.QTableWidgetItem(hex(entry.end)))
+                self.setItem(i, self.COL_SIZE, _SizeItem(entry.size()))
 
-            size = entry.size()
-            self.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{hex(size)} ({size})"))
+                perm_str = ""
+                perm_str += "R" if entry.perm & ida_segment.SEGPERM_READ else "."
+                perm_str += "W" if entry.perm & ida_segment.SEGPERM_WRITE else "."
+                perm_str += "X" if entry.perm & ida_segment.SEGPERM_EXEC else "."
+                attr_str = f"{perm_str} | T:{entry.seg_type} | A:{entry.align}"
+                if entry.recursive:
+                    attr_str += " | rec"
 
-            perm_str = ""
-            perm_str += "R" if entry.perm & ida_segment.SEGPERM_READ else "."
-            perm_str += "W" if entry.perm & ida_segment.SEGPERM_WRITE else "."
-            perm_str += "X" if entry.perm & ida_segment.SEGPERM_EXEC else "."
-            attr_str = f"{perm_str} | T:{entry.seg_type} | A:{entry.align}"
-            if entry.recursive:
-                attr_str += " | rec"
-            self.setItem(i, 4, QtWidgets.QTableWidgetItem(attr_str))
-            self.setItem(i, 5, QtWidgets.QTableWidgetItem(entry.sig))
+                # Attributes is a composite rendering and Sig is derived from the
+                # bytes; neither round-trips through a text editor, so both stay
+                # read-only and keep going through the Edit dialog.
+                for col, text in ((self.COL_ATTRS, attr_str), (self.COL_SIG, entry.sig)):
+                    item = QtWidgets.QTableWidgetItem(text)
+                    item.setFlags(item.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
+                    self.setItem(i, col, item)
+        finally:
+            self.blockSignals(False)
         self.apply_filter(self._filter_text)
+
+    def on_item_changed(self, item):
+        """Commit an inline cell edit back onto the entry. Anything unparseable
+        or out of order reverts, by rebuilding the row from the entry it failed
+        to change."""
+        row, col = item.row(), item.column()
+        if row >= len(self.entries):
+            return
+        entry = self.entries[row]
+        text = item.text().strip()
+        old_start, old_end = entry.start, entry.end
+
+        if col == self.COL_NAME:
+            if not text:
+                print("[IDASlicer] Name cannot be empty.")
+                self.refresh()
+                return
+            entry.name = text
+        elif col in (self.COL_START, self.COL_END, self.COL_SIZE):
+            try:
+                value = int(text, 0)
+            except ValueError:
+                print(f"[IDASlicer] Not a hex value: {text!r}")
+                self.refresh()
+                return
+            if value < 0:
+                print(f"[IDASlicer] Negative value: {text!r}")
+                self.refresh()
+                return
+            if col == self.COL_START:
+                if value > entry.end:
+                    print(f"[IDASlicer] Start {hex(value)} is past End {hex(entry.end)}.")
+                    self.refresh()
+                    return
+                entry.start = value
+            elif col == self.COL_END:
+                if value < entry.start:
+                    print(f"[IDASlicer] End {hex(value)} is before Start {hex(entry.start)}.")
+                    self.refresh()
+                    return
+                entry.end = value
+            else:
+                entry.end = entry.start + value
+            entry.update_sig()
+        else:
+            return
+
+        self.refresh()
+        self.plugin.save_config()
+
+        # Same rule as the Edit dialog: a recursive entry whose range moved gets
+        # its new range scanned for references.
+        if entry.recursive and (entry.start, entry.end) != (old_start, old_end):
+            self.plugin.rescan_range_entry(entry)
 
     def apply_filter(self, text):
         """Hide rows where no column contains `text` (case-insensitive)."""
@@ -660,15 +755,33 @@ class SlicerTable(QtWidgets.QTableWidget):
             self.setRowHidden(row, not hit)
 
     def on_cell_clicked(self, row, col):
-        """Clicking the Start or End cell jumps the IDA view to that address."""
-        if col not in (1, 2):
+        """Clicking the Start or End cell jumps the IDA view to that address.
+
+        Qt delivers the first click of a double click as an ordinary click, so
+        jumping right here would navigate away every time the user double clicks
+        the cell to edit it. Hold the jump for the double-click interval instead;
+        `on_cell_double_clicked` cancels it if the second click arrives. The cost
+        is that a real single click navigates that much later."""
+        if col not in (self.COL_START, self.COL_END):
             return
         item = self.item(row, col)
         if item is None:
             return
         try:
-            ea = int(item.text(), 16)
+            self._pending_jump = int(item.text(), 16)
         except ValueError:
+            return
+        self._jump_timer.start(QtWidgets.QApplication.doubleClickInterval())
+
+    def on_cell_double_clicked(self, row, col):
+        """The cell editor is opening -- drop the jump the first click queued."""
+        self._jump_timer.stop()
+        self._pending_jump = None
+
+    def _do_pending_jump(self):
+        ea = self._pending_jump
+        self._pending_jump = None
+        if ea is None:
             return
         # The End value is an exclusive bound, so it often points one past the
         # last mapped byte (unmapped). Back up to the last mapped address so the
@@ -744,15 +857,46 @@ class SlicerTable(QtWidgets.QTableWidget):
         name_edit = QtWidgets.QLineEdit(entry.name)
         start_edit = QtWidgets.QLineEdit(hex(entry.start))
         end_edit = QtWidgets.QLineEdit(hex(entry.end))
+        size_edit = QtWidgets.QLineEdit(hex(entry.size()))
         perm_edit = QtWidgets.QLineEdit(str(entry.perm))
         type_edit = QtWidgets.QLineEdit(str(entry.seg_type))
         align_edit = QtWidgets.QLineEdit(str(entry.align))
         recursive_check = QtWidgets.QCheckBox("Re-scan references when the range changes")
         recursive_check.setChecked(entry.recursive)
 
+        # Size is a derived view of End: typing a size moves End, while editing
+        # Start or End recomputes Size. End stays the authoritative field that
+        # the accept handler below reads. These connect to textEdited rather
+        # than textChanged because textEdited does not fire on setText(), so the
+        # two handlers cannot retrigger each other.
+        def _parse_hex(text):
+            try:
+                return int(text.strip(), 16)
+            except ValueError:
+                return None
+
+        def sync_end_from_size(_text=None):
+            start = _parse_hex(start_edit.text())
+            size = _parse_hex(size_edit.text())
+            if start is None or size is None or size < 0:
+                return
+            end_edit.setText(hex(start + size))
+
+        def sync_size_from_end(_text=None):
+            start = _parse_hex(start_edit.text())
+            end = _parse_hex(end_edit.text())
+            if start is None or end is None or end < start:
+                return
+            size_edit.setText(hex(end - start))
+
+        size_edit.textEdited.connect(sync_end_from_size)
+        end_edit.textEdited.connect(sync_size_from_end)
+        start_edit.textEdited.connect(sync_size_from_end)
+
         layout.addRow("Name:", name_edit)
         layout.addRow("Start (hex):", start_edit)
         layout.addRow("End (hex):", end_edit)
+        layout.addRow("Size (hex):", size_edit)
         layout.addRow("Permissions (int):", perm_edit)
         layout.addRow("Type (int):", type_edit)
         layout.addRow("Alignment (int):", align_edit)
@@ -830,6 +974,13 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.import_seg_button = QtWidgets.QPushButton("Import .seg files")
         self.import_seg_button.clicked.connect(self.on_import_seg_clicked)
         self.layout.addWidget(self.import_seg_button)
+
+    def OnClose(self, form):
+        # IDA destroys the Qt widgets when the form closes, but this Python
+        # object survives. Drop the plugin's reference so later refreshes are
+        # skipped and the next Show() builds a fresh form, instead of reaching
+        # through to an already-deleted QTableWidget.
+        self.plugin.form = None
 
     def on_slice_clicked(self):
         if not ida_domain:
@@ -1448,7 +1599,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         existing_ranges = {(e.start, e.end) for e in self.entries}
         overwrite_all = False
         with ida_domain.Database.open(save_on_close=False) as db:
-            existing_names = [s.name for s in db.segments]
+            # segment_t.name is a uval_t index into IDA's name storage, not a
+            # string -- the name has to come from the collection accessor.
+            existing_names = [db.segments.get_name(s) for s in db.segments]
 
             def get_unique_name(base_name, current_names):
                 if base_name not in current_names:
@@ -1513,6 +1666,11 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
                 overlaps.sort(key=lambda s: s.start_ea)
 
+                # Regions whose bytes actually get written below. A declined
+                # overwrite leaves the existing data in place, and step 3 must
+                # not stamp the imported names onto data it did not import.
+                written = []
+
                 # 1. Overwrite overlapping parts
                 for s in overlaps:
                     o_start = max(s.start_ea, start)
@@ -1540,6 +1698,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     offset = o_start - start
                     chunk = content[offset : offset + (o_end - o_start)]
                     db.bytes.set_bytes_at(o_start, chunk)
+                    written.append((o_start, o_end))
                     results.append(f"Overwrote part of '{db.segments.get_name(s)}' at {hex(o_start)}-{hex(o_end)}")
 
                 # 2. Create segments for gaps
@@ -1554,6 +1713,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                             offset = current_pos - start
                             chunk = content[offset : offset + (s.start_ea - current_pos)]
                             db.bytes.set_bytes_at(current_pos, chunk)
+                            written.append((current_pos, s.start_ea))
                             results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}")
                             existing_names.append(unique_name)
                     current_pos = max(current_pos, s.end_ea)
@@ -1567,17 +1727,23 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                         offset = current_pos - start
                         chunk = content[offset : offset + (end - current_pos)]
                         db.bytes.set_bytes_at(current_pos, chunk)
+                        written.append((current_pos, end))
                         results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}")
                         existing_names.append(unique_name)
 
-                # 3. Restore names collected from the source database.
+                # 3. Restore names collected from the source database, but only
+                # at addresses whose bytes were actually written above.
                 for off, nm in payload.get("names", []):
-                    ida_name.set_name(start + off, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK)
+                    ea = start + off
+                    if any(ws <= ea < we for ws, we in written):
+                        ida_name.set_name(ea, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK)
 
                 # 4. Surface the imported range in the slicer list so the user
-                # can see what was brought in. The content is already written to
-                # the database above, so the entry's signature matches.
-                if (start, end) not in existing_ranges:
+                # can see what was brought in. Skipped when nothing was written:
+                # a fully declined overwrite imported nothing, so there is no new
+                # range to list. The signature is re-read from the database, so
+                # it reflects what actually landed rather than what was offered.
+                if written and (start, end) not in existing_ranges:
                     existing_ranges.add((start, end))
                     imported_entries.append(
                         SlicerEntry(
