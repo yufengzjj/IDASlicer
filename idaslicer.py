@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 
 import ida_bytes
 import ida_funcs
@@ -95,6 +96,58 @@ if __name__ == "__main__":
 """
 
 # --- Data Model ---
+
+
+def _merge_intervals(intervals: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge contiguous/overlapping intervals into runs; leave real gaps as-is.
+    Accepts any iterable of ``(start, end)`` (list or set) -- it sorts a set() of them.
+
+    This runs *after* a scan finishes, on its results. It is not part of the
+    scanner: `processed_ranges` / `_is_range_covered` still own termination, and
+    nothing here feeds back into a worklist."""
+    intervals = sorted(set(intervals))
+    if not intervals:
+        return []
+    merged = []
+    cs, ce = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= ce:
+            ce = max(ce, e)
+        else:
+            merged.append((cs, ce))
+            cs, ce = s, e
+    merged.append((cs, ce))
+    return merged
+
+
+def _added_msg(added: int, extended: int) -> str:
+    """Report what a scan did to the list. Merging means a discovery can land
+    without creating a row -- it stretches an entry instead -- so "added 0" on
+    its own would read as "nothing happened"."""
+    if added and extended:
+        return f"Added {added} ranges and extended {extended} existing ones."
+    if extended:
+        return f"Extended {extended} existing ranges."
+    return f"Added {added} ranges to the slicer list."
+
+
+def _merge_entries(entries: list) -> list:
+    """Collapse entries whose ranges touch or overlap into one entry per run.
+    The entry that *starts* a run survives and is stretched to the run's end:
+    its name and permissions already describe that start, and `_range_name`
+    derives names from the start too, so the naming stays consistent. `sig` is
+    recomputed because the range changed."""
+    by_start = {}
+    for e in entries:
+        by_start.setdefault(e.start, e)
+    merged = []
+    for start, end in _merge_intervals((e.start, e.end) for e in entries):
+        head = by_start[start]
+        if head.end != end:
+            head.end = end
+            head.update_sig()
+        merged.append(head)
+    return merged
 
 
 class SlicerEntry:
@@ -1465,12 +1518,14 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             self.form.table.refresh()
 
     @staticmethod
-    def _apply_seg_attrs(seg_start, seg_type, align):
+    def _apply_seg_attrs(s, seg_type, align):
         """Apply numeric segment type and alignment to a freshly created segment.
-        No-op when these were not recorded in the payload (None)."""
+        Takes the segment handle its caller just created rather than looking one
+        up by address, so it can never land on a neighbouring segment that
+        already existed. No-op when these were not recorded in the payload
+        (None)."""
         if seg_type is None and align is None:
             return
-        s = ida_segment.getseg(seg_start)
         if not s:
             return
         if seg_type is not None:
@@ -1497,49 +1552,53 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         return f"{base}_{hex(start)}"
 
     def _add_collected_ranges(self, ranges, origins=None):
-        """Turn collected (start, end) ranges into recursive SlicerEntries,
-        dropping exact duplicates and ranges fully contained in an existing
-        entry or in a larger range from this same batch. Returns the count
-        added (does not save/refresh — the caller does).
+        """Fold a scan's (start, end) ranges into the slicer list, merging them
+        with each other *and* with the entries already listed — the same whole-list
+        merge the importer does, so a discovery that abuts an existing entry
+        extends it instead of adding a second row. Returns
+        `(added, extended)`: new rows, and existing rows whose range grew. Does
+        not save/refresh — the caller does.
 
         `origins` supplies each range's referring address for the Ref column."""
         origins = origins or {}
         existing = [(e.start, e.end) for e in self.entries]
-        existing_set = set(existing)
+        # Keyed by identity, and holding the entry itself so no id() can be
+        # recycled while the comparison below is still pending.
+        ends_before = {id(e): (e, e.end) for e in self.entries}
 
         def _contained(s, e, others):
             for cs, ce in others:
-                if cs <= s and e <= ce and (cs, ce) != (s, e):
+                if cs <= s and e <= ce:
                     return True
             return False
 
-        # Process largest ranges first so that a range fully contained in a
-        # bigger one (already present, or kept earlier in this pass) is dropped,
-        # avoiding redundant overlapping segments / overwrite prompts on import.
-        ordered = sorted(
-            {(s, e) for s, e in ranges if s < e},
-            key=lambda r: r[1] - r[0],
-            reverse=True,
-        )
-
-        kept = []
-        for start, end in ordered:
-            if (start, end) in existing_set:
+        # Merge the batch first: a scan turns up many adjacent slivers (a
+        # function's chunks, a pointer table walked item by item) that would each
+        # otherwise become their own row and their own segment on export/import.
+        # Runs already covered by an existing entry are dropped here rather than
+        # in the whole-list merge below -- they cannot change its outcome, and
+        # skipping them avoids building a SlicerEntry (and hashing its bytes) only
+        # to throw it away. A run's start is always one of the original starts, so
+        # `origins` and `_range_name` still resolve.
+        candidates = []
+        for start, end in _merge_intervals((s, e) for s, e in ranges if s < e):
+            if _contained(start, end, existing):
                 continue
-            if _contained(start, end, existing) or _contained(start, end, kept):
-                continue
-            kept.append((start, end))
-
-        added = 0
-        for start, end in kept:
             seg = ida_segment.getseg(start)
             if not seg:
                 continue
             name = self._range_name(start, seg)
-            entry = SlicerEntry(name, start, end, seg.perm, seg.type, seg.align, recursive=True, ref=origins.get(start))
-            self.entries.append(entry)
-            added += 1
-        return added
+            candidates.append(SlicerEntry(name, start, end, seg.perm, seg.type, seg.align, recursive=True, ref=origins.get(start)))
+
+        if not candidates:
+            return 0, 0
+
+        # Existing entries first, so a hand-edited entry outranks a fresh
+        # discovery starting at the same address.
+        before = len(self.entries)
+        self.entries = _merge_entries(self.entries + candidates)
+        extended = sum(1 for e in self.entries if id(e) in ends_before and e.end != ends_before[id(e)][1])
+        return len(self.entries) - before, extended
 
     def add_function_recursive(self, start_ea: int):
         """Add the function at start_ea and every code/data range it references
@@ -1556,13 +1615,13 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         finally:
             ida_kernwin.hide_wait_box()
 
-        added = self._add_collected_ranges(ranges, origins)
+        added, extended = self._add_collected_ranges(ranges, origins)
         self.save_config()
         if self.form:
             self.form.table.refresh()
 
-        print(f"[IDASlicer] Recursive scan of {hex(start_ea)}: {len(ranges)} ranges found, {added} added to slicer list.")
-        ida_kernwin.info(f"Added {added} ranges to the slicer list.")
+        print(f"[IDASlicer] Recursive scan of {hex(start_ea)}: {len(ranges)} ranges found, {added} added / {extended} extended.")
+        ida_kernwin.info(_added_msg(added, extended))
 
     def add_ranges_recursive(self, seed_ranges):
         """Like `add_function_recursive`, but seeded from reconstructed ranges
@@ -1580,14 +1639,14 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         finally:
             ida_kernwin.hide_wait_box()
 
-        added = self._add_collected_ranges(ranges, origins)
+        added, extended = self._add_collected_ranges(ranges, origins)
         self.save_config()
         if self.form:
             self.form.table.refresh()
 
         seeds = ", ".join(hex(s) for s, _ in seed_ranges) or "(none)"
-        print(f"[IDASlicer] Recursive scan of [{seeds}]: {len(ranges)} ranges found, {added} added to slicer list.")
-        ida_kernwin.info(f"Added {added} ranges to the slicer list.")
+        print(f"[IDASlicer] Recursive scan of [{seeds}]: {len(ranges)} ranges found, {added} added / {extended} extended.")
+        ida_kernwin.info(_added_msg(added, extended))
 
     def rescan_range_entry(self, entry):
         """Re-scan an edited recursive entry's range for references and add any
@@ -1604,14 +1663,14 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         finally:
             ida_kernwin.hide_wait_box()
 
-        added = self._add_collected_ranges(ranges, origins)
+        added, extended = self._add_collected_ranges(ranges, origins)
         self.save_config()
         if self.form:
             self.form.table.refresh()
 
-        print(f"[IDASlicer] Re-scan of {hex(entry.start)}-{hex(entry.end)}: {len(ranges)} ranges found, {added} new added to slicer list.")
-        if added:
-            ida_kernwin.info(f"Added {added} new ranges from the re-scan.")
+        print(f"[IDASlicer] Re-scan of {hex(entry.start)}-{hex(entry.end)}: {len(ranges)} ranges found, {added} added / {extended} extended.")
+        if added or extended:
+            ida_kernwin.info(_added_msg(added, extended))
 
     def detect_file_type(self):
         ftype_enum = ida_ida.inf_get_filetype()
@@ -1848,6 +1907,10 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         imported_entries = []
         existing_ranges = {(e.start, e.end) for e in self.entries}
         overwrite_all = False
+        # Every payload has to end up in exactly one of these buckets, so the
+        # summary can account for an import that changed nothing. "It did
+        # nothing" and "it was never read" look identical without them.
+        stats = {"files": len(files), "unreadable": 0, "seen": 0, "invalid": 0, "sig_skipped": 0, "declined": 0, "duplicate": 0, "listed": 0}
         with ida_domain.Database.open(save_on_close=False) as db:
             # segment_t.name is a uval_t index into IDA's name storage, not a
             # string -- the name has to come from the collection accessor.
@@ -1861,15 +1924,22 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     counter += 1
                 return f"{base_name}{counter}"
 
-            required_keys = {"start", "end", "perm", "seg_class", "content"}
+            # "content" is deliberately not required: a payload that only declares
+            # a range carries no bytes, and omitting the key says exactly what an
+            # empty one does. The remaining four have no sensible default --
+            # without them there is no segment to create.
+            required_keys = {"start", "end", "perm", "seg_class"}
 
             def process_payload(payload, src):
                 """Import one range payload. Merging changes nothing here: a
                 merged file just yields several payloads, each handled exactly
                 like a standalone single-range file."""
                 nonlocal overwrite_all
+                stats["seen"] += 1
                 if not isinstance(payload, dict) or not required_keys.issubset(payload):
-                    print(f"Skipping invalid segment in {src}")
+                    stats["invalid"] += 1
+                    have = sorted(payload) if isinstance(payload, dict) else type(payload).__name__
+                    results.append(f"Skipped an invalid payload in {src} (needs {sorted(required_keys)}, has {have})")
                     return
 
                 name = payload.get("name", "")
@@ -1879,7 +1949,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 seg_type = payload.get("seg_type")
                 align = payload.get("align")
                 seg_class = payload["seg_class"]
-                content = payload["content"]
+                content = payload.get("content") or b""
                 expected_sig = payload.get("sig")
 
                 # Strip the original "_{start}" suffix so each created segment can
@@ -1889,21 +1959,31 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 addr_suffix = f"_{hex(start)}"
                 base_name = name[: -len(addr_suffix)] if name.endswith(addr_suffix) else name
 
-                # MD5 Validation
-                actual_sig = hashlib.md5(content).hexdigest()
-                if expected_sig and actual_sig != expected_sig:
-                    msg = f"MD5 mismatch for {base_name or src}!\n\nExpected: {expected_sig}\nActual: {actual_sig}\n\nDo you want to skip this range?"
-                    res = QtWidgets.QMessageBox.question(
-                        None,
-                        "Validation Error",
-                        msg,
-                        QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                        QtWidgets.QMessageBox.StandardButton.Yes,
-                    )
-                    if res == QtWidgets.QMessageBox.StandardButton.Yes:
-                        return
+                # A payload may carry no bytes at all: an externally produced .seg
+                # that only *declares* a range. That is not a reason to skip it --
+                # the segment still gets created and the range still reaches the
+                # slicer list. There is simply nothing to write and nothing to
+                # verify, so the byte-level steps below are all guarded on this.
+                has_content = bool(content)
 
-                if len(content) != (end - start):
+                # MD5 Validation
+                if has_content and expected_sig:
+                    actual_sig = hashlib.md5(content).hexdigest()
+                    if actual_sig != expected_sig:
+                        msg = f"MD5 mismatch for {base_name or src}!\n\nExpected: {expected_sig}\nActual: {actual_sig}\n\nDo you want to skip this range?"
+                        res = QtWidgets.QMessageBox.question(
+                            None,
+                            "Validation Error",
+                            msg,
+                            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                            QtWidgets.QMessageBox.StandardButton.Yes,
+                        )
+                        if res == QtWidgets.QMessageBox.StandardButton.Yes:
+                            stats["sig_skipped"] += 1
+                            results.append(f"Skipped '{base_name or src}' at {hex(start)}-{hex(end)}: MD5 mismatch")
+                            return
+
+                if has_content and len(content) != (end - start):
                     print(f"Content size mismatch for {base_name or src}")
 
                 # Find all overlapping segments
@@ -1916,15 +1996,22 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
                 overlaps.sort(key=lambda s: s.start_ea)
 
-                # Regions whose bytes actually get written below. A declined
-                # overwrite leaves the existing data in place, and step 3 must
-                # not stamp the imported names onto data it did not import.
+                # Regions this payload took ownership of below -- bytes written
+                # into an existing segment, or a segment created for a gap. A
+                # declined overwrite leaves the existing data in place, and step 3
+                # must not stamp the imported names onto data it did not import.
                 written = []
 
                 # 1. Overwrite overlapping parts
                 for s in overlaps:
                     o_start = max(s.start_ea, start)
                     o_end = min(s.end_ea, end)
+
+                    if not has_content:
+                        # A byte-less payload claims nothing here: there is no
+                        # data to overwrite, so there is no conflict to ask about
+                        # and no reason to rename another segment's contents.
+                        continue
 
                     if not overwrite_all:
                         msg_box = QtWidgets.QMessageBox()
@@ -1959,12 +2046,15 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                         new_seg = db.segments.add(0, current_pos, s.start_ea, unique_name, seg_class)
                         if new_seg:
                             db.segments.set_permissions(new_seg, perm)
-                            self._apply_seg_attrs(current_pos, seg_type, align)
-                            offset = current_pos - start
-                            chunk = content[offset : offset + (s.start_ea - current_pos)]
-                            db.bytes.set_bytes_at(current_pos, chunk)
+                            self._apply_seg_attrs(new_seg, seg_type, align)
+                            if has_content:
+                                offset = current_pos - start
+                                chunk = content[offset : offset + (s.start_ea - current_pos)]
+                                db.bytes.set_bytes_at(current_pos, chunk)
                             written.append((current_pos, s.start_ea))
-                            results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}")
+                            results.append(
+                                f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}{'' if has_content else ' (no bytes)'}"
+                            )
                             existing_names.append(unique_name)
                     current_pos = max(current_pos, s.end_ea)
 
@@ -1973,36 +2063,64 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     new_seg = db.segments.add(0, current_pos, end, unique_name, seg_class)
                     if new_seg:
                         db.segments.set_permissions(new_seg, perm)
-                        self._apply_seg_attrs(current_pos, seg_type, align)
-                        offset = current_pos - start
-                        chunk = content[offset : offset + (end - current_pos)]
-                        db.bytes.set_bytes_at(current_pos, chunk)
+                        self._apply_seg_attrs(new_seg, seg_type, align)
+                        if has_content:
+                            offset = current_pos - start
+                            chunk = content[offset : offset + (end - current_pos)]
+                            db.bytes.set_bytes_at(current_pos, chunk)
                         written.append((current_pos, end))
-                        results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}")
+                        results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}{'' if has_content else ' (no bytes)'}")
                         existing_names.append(unique_name)
 
                 # 3. Restore names collected from the source database, but only
-                # at addresses whose bytes were actually written above.
+                # inside the regions claimed above -- never over a segment whose
+                # data this payload left untouched.
                 for off, nm in payload.get("names", []):
                     ea = start + off
                     if any(ws <= ea < we for ws, we in written):
                         ida_name.set_name(ea, nm, ida_name.SN_NOWARN | ida_name.SN_NOCHECK)
 
                 # 4. Surface the imported range in the slicer list so the user
-                # can see what was brought in. Skipped when nothing was written:
-                # a fully declined overwrite imported nothing, so there is no new
-                # range to list. The signature is re-read from the database, so
-                # it reflects what actually landed rather than what was offered.
-                if written and (start, end) not in existing_ranges:
+                # can see what was brought in. Skipped when a payload that *had*
+                # bytes wrote none of them: a fully declined overwrite imported
+                # nothing, so there is no new range to list. A byte-less payload
+                # is listed regardless -- declaring the range is the whole point
+                # of it. The signature is re-read from the database, so it
+                # reflects what actually landed rather than what was offered.
+                if not (written or not has_content):
+                    stats["declined"] += 1
+                    results.append(f"Imported nothing from '{base_name or src}' at {hex(start)}-{hex(end)}: every overwrite was declined")
+                elif (start, end) in existing_ranges:
+                    stats["duplicate"] += 1
+                else:
                     existing_ranges.add((start, end))
+                    stats["listed"] += 1
+                    # The payload's perm/type/align describe the *source*
+                    # database and are not necessarily right for this one, so
+                    # the local segment is the authority. getseg() answers both
+                    # cases correctly: a range that already lives in a local
+                    # segment yields that segment's real attributes, while a gap
+                    # yields the segment created above -- which carries the
+                    # payload's values only because nothing local described it.
+                    # The payload is the fallback for the one case getseg cannot
+                    # answer: no segment was created (add() failed).
+                    loc = ida_segment.getseg(start)
+                    # The address goes back on. Stripping it above serves the
+                    # segments, which may be several and each need their own
+                    # start; an entry is the whole range and has exactly one, so
+                    # dropping it here would leave every payload named after a
+                    # bare base -- three ranges all listed as "unk". Re-appending
+                    # also makes the round-trip exact: a name this plugin
+                    # exported ends with its own start, so strip+append returns
+                    # it unchanged, and it matches `_range_name`'s convention.
                     imported_entries.append(
                         SlicerEntry(
-                            base_name or f"imported_{hex(start)}",
+                            f"{base_name}_{hex(start)}" if base_name else f"imported_{hex(start)}",
                             start,
                             end,
-                            perm,
-                            seg_type if seg_type is not None else 0,
-                            align if align is not None else 0,
+                            loc.perm if loc else perm,
+                            loc.type if loc else (seg_type if seg_type is not None else 0),
+                            loc.align if loc else (align if align is not None else 0),
                         )
                     )
 
@@ -2013,7 +2131,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     with open(file_path, "rb") as f:
                         data = pickle.load(f)
                 except Exception as e:
-                    print(f"Failed to read {filename}: {e}")
+                    stats["unreadable"] += 1
+                    results.append(f"Failed to read {filename}: {e}")
                     continue
 
                 # A merged file is a wrapper dict carrying a list of payloads; a
@@ -2024,13 +2143,45 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 else:
                     process_payload(data, filename)
 
+        added = extended = absorbed = 0
         if imported_entries:
-            self.entries.extend(imported_entries)
+            # Merge the whole list at once -- existing entries together with every
+            # payload of every selected file, not per file and not imports alone.
+            # A range split on export, or one that abuts a range already listed,
+            # ends up as a single entry instead of a row per fragment. Existing
+            # entries come first so that when an import lands on an address
+            # already listed, the entry the user may have edited is the one that
+            # survives the run. Side effect: the list comes back sorted by start.
+            before = len(self.entries)
+            ends_before = {id(e): (e, e.end) for e in self.entries}
+            self.entries = _merge_entries(self.entries + imported_entries)
+            survivors = {id(e) for e in self.entries}
+            added = len(self.entries) - before
+            extended = sum(1 for e in self.entries if id(e) in ends_before and e.end != ends_before[id(e)][1])
+            # An imported entry that is not a row of its own was folded into one:
+            # either it stretched an existing entry or it was already covered.
+            absorbed = sum(1 for e in imported_entries if id(e) not in survivors)
             self.save_config()
             if self.form:
                 self.form.table.refresh()
 
-        summary = "\n".join(results) if results else "No changes made."
+        # Always report the tally, even when nothing changed. "No changes made."
+        # on its own cannot distinguish an import that was fully redundant from
+        # one whose files were never parsed, which is exactly when the user needs
+        # to know which happened.
+        results.append("")
+        results.append(f"Read {stats['seen']} payload(s) from {stats['files']} file(s), {stats['unreadable']} unreadable.")
+        results.append(
+            f"Payloads: {stats['listed']} taken, {stats['invalid']} invalid, "
+            f"{stats['sig_skipped']} skipped on MD5, {stats['declined']} declined, {stats['duplicate']} already listed."
+        )
+        results.append(f"Slicer list: {added} entr{'y' if added == 1 else 'ies'} added, {extended} extended, {absorbed} merged into existing.")
+
+        summary = "\n".join(results)
+        # Mirror it to the Output window: the dialog is modal and its contents are
+        # gone once dismissed, which makes an import impossible to review after
+        # the fact.
+        print(f"[IDASlicer] Import summary:\n{summary}")
         QtWidgets.QMessageBox.information(None, "Import Summary", summary)
 
 
