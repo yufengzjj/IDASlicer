@@ -1,0 +1,206 @@
+{
+ "leaf": {
+  "own": [
+   "leaf..callee_a",
+   "g_counter..g_unused"
+  ],
+  "recursive": [
+   "leaf..callee_a",
+   "g_counter..g_unused"
+  ]
+ },
+ "callee_a": {
+  "own": [
+   "callee_a..via_ptr"
+  ],
+  "recursive": [
+   "leaf..callee_a",
+   "callee_a..via_ptr",
+   "g_counter..g_unused"
+  ]
+ },
+ "via_ptr": {
+  "own": [
+   "via_ptr..via_ptr2"
+  ],
+  "recursive": [
+   "via_ptr..via_ptr2"
+  ]
+ },
+ "via_ptr2": {
+  "own": [
+   "via_ptr2..dispatch"
+  ],
+  "recursive": [
+   "via_ptr2..dispatch"
+  ]
+ },
+ "dispatch": {
+  "own": [
+   "dispatch..walk",
+   "g_table..g_n2"
+  ],
+  "recursive": [
+   "via_ptr..via_ptr2",
+   "via_ptr2..dispatch",
+   "dispatch..walk",
+   "g_table..g_n2"
+  ]
+ },
+ "walk": {
+  "own": [
+   "walk..tail_target",
+   "g_n2..g_n1",
+   "g_n1..g_bss"
+  ],
+  "recursive": [
+   "walk..tail_target",
+   "g_n2..g_n1",
+   "g_n1..g_bss"
+  ]
+ },
+ "tail_target": {
+  "own": [
+   "tail_target..tailer"
+  ],
+  "recursive": [
+   "tail_target..tailer"
+  ]
+ },
+ "tailer": {
+  "own": [
+   "tailer..tail_target2"
+  ],
+  "recursive": [
+   "tail_target..tailer",
+   "tailer..tail_target2"
+  ]
+ },
+ "tail_target2": {
+  "own": [
+   "tail_target2..cond_tail"
+  ],
+  "recursive": [
+   "tail_target2..cond_tail"
+  ]
+ },
+ "cond_tail": {
+  "own": [
+   "cond_tail..fill_bss"
+  ],
+  "recursive": [
+   "tail_target2..cond_tail",
+   "cond_tail..fill_bss"
+  ]
+ },
+ "fill_bss": {
+  "own": [
+   "fill_bss..uncalled",
+   "g_bss..g_split"
+  ],
+  "recursive": [
+   "leaf..callee_a",
+   "fill_bss..uncalled",
+   "g_counter..g_unused",
+   "g_bss..g_split"
+  ]
+ },
+ "uncalled": {
+  "own": [
+   "uncalled..root"
+  ],
+  "recursive": [
+   "uncalled..root"
+  ]
+ },
+ "root": {
+  "own": [
+   "g_msg..g_msg+0x10",
+   "root.._start"
+  ],
+  "recursive": [
+   "g_msg..g_msg+0x10",
+   "leaf..callee_a",
+   "callee_a..via_ptr",
+   "via_ptr..via_ptr2",
+   "via_ptr2..dispatch",
+   "dispatch..walk",
+   "walk..tail_target",
+   "tail_target..tailer",
+   "tailer..tail_target2",
+   "tail_target2..cond_tail",
+   "cond_tail..fill_bss",
+   "fill_bss..uncalled",
+   "root.._start",
+   "g_counter..g_unused",
+   "g_table..g_n2",
+   "g_n2..g_n1",
+   "g_n1..g_bss",
+   "g_bss..g_split"
+  ]
+ },
+ "_start": {
+  "own": [
+   "_start..split_leaf"
+  ],
+  "recursive": [
+   "g_msg..g_msg+0x10",
+   "leaf..callee_a",
+   "callee_a..via_ptr",
+   "via_ptr..via_ptr2",
+   "via_ptr2..dispatch",
+   "dispatch..walk",
+   "walk..tail_target",
+   "tail_target..tailer",
+   "tailer..tail_target2",
+   "tail_target2..cond_tail",
+   "cond_tail..fill_bss",
+   "fill_bss..uncalled",
+   "root.._start",
+   "_start..split_leaf",
+   "g_counter..g_unused",
+   "g_table..g_n2",
+   "g_n2..g_n1",
+   "g_n1..g_bss",
+   "g_bss..g_split"
+  ]
+ },
+ "split_leaf": {
+  "own": [
+   "split_leaf..split_entry",
+   "g_split..g_split+0x100"
+  ],
+  "recursive": [
+   "split_leaf..split_entry",
+   "g_split..g_split+0x100"
+  ]
+ },
+ "split_entry": {
+  "own": [
+   "split_entry..split_entry+0x30"
+  ],
+  "recursive": [
+   "g_msg..g_msg+0x10",
+   "leaf..callee_a",
+   "callee_a..via_ptr",
+   "via_ptr..via_ptr2",
+   "via_ptr2..dispatch",
+   "dispatch..walk",
+   "walk..tail_target",
+   "tail_target..tailer",
+   "tailer..tail_target2",
+   "tail_target2..cond_tail",
+   "cond_tail..fill_bss",
+   "fill_bss..uncalled",
+   "root.._start",
+   "split_leaf..split_entry",
+   "split_entry..split_entry+0x30",
+   "g_counter..g_unused",
+   "g_table..g_n2",
+   "g_n2..g_n1",
+   "g_n1..g_bss",
+   "g_bss..g_split",
+   "g_split..g_split+0x100"
+  ]
+ }
+}

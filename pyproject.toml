@@ -10,9 +10,15 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.168.5",
     "idapro>=0.0.7",
     "pyside6>=6.11.0",
+    "pytest>=9.1.1",
 ]
 
 [tool.ruff]
 line-length = 150
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]

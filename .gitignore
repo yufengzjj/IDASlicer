@@ -9,3 +9,5 @@ wheels/
 # Virtual environments
 .venv
 idaslicer_config.json
+CLAUDE.md
+docs/worker-corrupt-i64/

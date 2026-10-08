@@ -74,7 +74,8 @@ def run_worker(data_path):
                         problems.append(f"{unique_name}: could not add segment {hex(start)}-{hex(end)}")
                         continue
                     db.segments.set_permissions(seg, entry_data['perm'])
-                    # set_permissions() does not save the segment; update() does.
+                    # IDA's API asks for update() after segment fields change;
+                    # set_permissions() does not call it.
                     seg_obj = ida_segment.getseg(start)
                     if seg_obj is not None:
                         if entry_data.get('seg_type') is not None:
@@ -336,7 +337,9 @@ def _read_range(ea: int, size: int) -> tuple[bytes | None, list[tuple[int, int]]
     """The bytes of [ea, ea + size), and the (offset, length) runs of them that
     have a value. Bytes without one (BSS, extern) still read back as filler, so
     only the runs may be written out: writing the filler would turn memory that
-    starts zeroed into garbage. Returns (None, []) if nothing can be read."""
+    starts zeroed into garbage. With no run at all the content is b"", which a
+    .seg and the worker both take as a range declared without bytes. Returns
+    (None, []) if nothing can be read."""
     if size <= 0:
         return None, []
     got = ida_bytes.get_bytes_and_mask(ea, size)
@@ -356,7 +359,7 @@ def _read_range(ea: int, size: int) -> tuple[bytes | None, list[tuple[int, int]]
         n = (x ^ (x + 1)).bit_length() - 1  # count the bytes with one
         runs.append((off, n))
         off += n
-    return content, runs
+    return (content if runs else b""), runs
 
 
 # Scanner tuning, edited via the panel's Settings button and persisted globally
@@ -390,20 +393,40 @@ def _apply_stored_settings(stored):
         SETTINGS["skip_named_data"] = val
 
 
+def _ends_unexplored_run(flags) -> bool:
+    # A referenced byte carries a dummy name, which ends the walk.
+    return not ida_bytes.is_unknown(flags) or ida_bytes.has_any_name(flags) or ida_bytes.has_xref(flags)
+
+
 def get_loose_data_range(ea, max_explore_len=0):
+    """The data from `ea` up to the next name, code, or segment end, item by
+    item: without type information, the next referenced address (IDA names
+    every one) is the best guess at where the object ends. Capped at
+    `max_explore_len` bytes, except where `ea` has no value (BSS): such a range
+    costs nothing to carry, and cutting it short would leave the object
+    partly outside the slice."""
     end_ea = ea
     seg = ida_segment.getseg(ea)
     seg_end = seg.end_ea if seg else idaapi.BADADDR
+    capped = ida_bytes.is_loaded(ea)
     while True:
         if end_ea == idaapi.BADADDR or end_ea >= seg_end or not ida_bytes.is_mapped(end_ea):
             break
-        if end_ea != ea and ida_name.get_name(end_ea):
+        flags = ida_bytes.get_flags(end_ea)
+        if end_ea != ea and (ida_name.get_name(end_ea) or ida_bytes.is_code(flags)):
             break
-        next_ea = ida_bytes.get_item_end(end_ea)
+        if not capped and ida_bytes.is_unknown(flags):
+            # One search instead of a step per byte: every unexplored byte is an
+            # item of its own, and a BSS can hold millions of them.
+            next_ea = ida_bytes.next_that(end_ea, seg_end, _ends_unexplored_run)
+            if next_ea == idaapi.BADADDR:
+                next_ea = seg_end
+        else:
+            next_ea = ida_bytes.get_item_end(end_ea)
         if next_ea <= end_ea or next_ea == idaapi.BADADDR:
             break
         end_ea = next_ea
-        if max_explore_len <= 0 or end_ea - ea >= max_explore_len:
+        if max_explore_len <= 0 or (capped and end_ea - ea >= max_explore_len):
             break
     return ida_range.range_t(ea, end_ea)
 
@@ -552,15 +575,17 @@ def _inside_func(func, start: int, end: int) -> bool:
 
 
 def _data_target_range(ea: int, max_explore_len: int) -> ida_range.range_t:
-    """The range to collect for a reference to data at `ea`: the whole item it
-    lands in, from the item's head -- code handed a pointer into a struct or
-    array may reach the fields before it too. Data without a size is glued onto
-    its neighbours by `get_loose_data_range` instead."""
+    """The range to collect for a reference to data at `ea`: from the head of
+    the item it lands in -- code handed a pointer into a struct or array may
+    reach the fields before it too -- through the whole item, and on to where
+    `get_loose_data_range` thinks the object ends. IDA often types only the
+    first field of a struct or the first element of a table."""
     head = ida_bytes.get_item_head(ea)
-    size = ida_bytes.get_item_size(head)
-    if size <= 1:
-        return get_loose_data_range(ea, max_explore_len)
-    return ida_range.range_t(head, head + size)
+    size = max(ida_bytes.get_item_size(head), 1)
+    if max_explore_len <= 0:
+        return ida_range.range_t(head, head + size)
+    loose = get_loose_data_range(head, max(max_explore_len, size))
+    return ida_range.range_t(head, max(head + size, loose.end_ea))
 
 
 def check_func_range(
@@ -641,6 +666,35 @@ def check_orphan_jumps(
                 continue
             if ida_funcs.get_func(ref.to) is None:
                 check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges, origins, head)
+
+
+def check_fall_through(
+    ranges,
+    cur_range: tuple[int, int],
+    cur_func: ida_funcs.func_t,
+    funcs_to_export: _FuncQueue | None,
+    processed_ranges: _Coverage,
+    origins: dict,
+):
+    """Follow code that runs off the end of `cur_range` without a jump, which
+    the XREF_FAR walks never see. Without symbols IDA may end a function where
+    execution goes on -- after a leading `nop` it took for padding -- and start
+    another there. That code is the rest of this function, so it is collected
+    in both modes, like a chunk."""
+    end = cur_range[1]
+    if not ida_bytes.is_flow(ida_bytes.get_flags(end)):
+        return
+    last = ida_bytes.prev_head(end, cur_range[0])
+    func = ida_funcs.get_func(end)
+    if func is None:
+        check_func_range(ranges, end, cur_func, funcs_to_export, processed_ranges, origins, last)
+        return
+    # A call followed by another function's start is a noreturn call IDA took
+    # for one that returns, not a split function.
+    after_call = any(x.type in (ida_xref.fl_CN, ida_xref.fl_CF) for x in idautils.XrefsFrom(last, ida_xref.XREF_FAR))
+    if func.start_ea == end != cur_func.start_ea and not after_call and not processed_ranges.covers(end, func.end_ea):
+        _record_origin(origins, end, last)
+        ranges.append(ida_range.range_t(end, func.end_ea))
 
 
 def get_ref_from_insn(ea):
@@ -737,7 +791,8 @@ def _data_pointers(start: int, end: int, ptr_size: int) -> dict[int, int]:
     - Raw values from pointer-aligned slots cover pointers IDA never typed. A
       lone pointer-sized item is read wherever it sits, aligned or not.
 
-    Code and strings are skipped."""
+    Code, strings and bytes without a value are skipped: the last hold no
+    pointer, and reading them would make a large BSS cost a slot per 8 bytes."""
     byteorder = "big" if ida_ida.inf_is_be() else "little"
     found = {}
     ea = start
@@ -754,12 +809,13 @@ def _data_pointers(start: int, end: int, ptr_size: int) -> dict[int, int]:
         if item_end <= ea:
             break
         if not (ida_bytes.is_code(flags) or ida_bytes.is_strlit(flags)):
-            data = ida_bytes.get_bytes(ea, item_end - ea) or b""
-            first = ea if len(data) == ptr_size else (ea + ptr_size - 1) // ptr_size * ptr_size
-            for slot in range(first, ea + len(data) - ptr_size + 1, ptr_size):
-                off = slot - ea
-                found.setdefault(int.from_bytes(data[off : off + ptr_size], byteorder), slot)
-            if not ida_bytes.is_unknown(flags):
+            data, runs = _read_range(ea, item_end - ea)
+            for off, n in runs:
+                lo, hi = ea + off, ea + off + n
+                first = lo if hi - lo == ptr_size == item_end - ea else (lo + ptr_size - 1) // ptr_size * ptr_size
+                for slot in range(first, hi - ptr_size + 1, ptr_size):
+                    found.setdefault(int.from_bytes(data[slot - ea : slot - ea + ptr_size], byteorder), slot)
+            if runs and not ida_bytes.is_unknown(flags):
                 for a in [ea, *range((ea + 4) // 4 * 4, item_end, 4)]:
                     for x in idautils.XrefsFrom(a, ida_xref.XREF_DATA):
                         found.setdefault(x.to, a)
@@ -895,6 +951,7 @@ def _scan_worklist(
             else:
                 for head in idautils.Heads(start, end):
                     check_c_ref_range(work, head, (start, end), cur_func, funcs_to_export, processed_ranges, origins)
+            check_fall_through(work, (start, end), cur_func, funcs_to_export, processed_ranges, origins)
             check_o_ref_range(work, (start, end), cur_func, funcs_to_export, processed_ranges, origins)
         else:
             check_d_ref_range(work, (start, end), cur_func, funcs_to_export, processed_ranges, origins)
@@ -1405,11 +1462,13 @@ class SettingsDialog(QtWidgets.QDialog):
         self.explore_spin.setSuffix(" bytes")
         self.explore_spin.setValue(SETTINGS["max_explore_len"])
         self.explore_spin.setToolTip(
-            "When a reference lands on data whose extent IDA has not defined, adjacent\n"
-            "unnamed items are glued together until the span reaches this length. It is\n"
-            "a threshold, not a hard cap: the item that crosses the line is taken whole,\n"
+            "When a reference lands on data, the item it hits is taken whole, and the\n"
+            "unnamed items after it are added until the span reaches this length -- IDA\n"
+            "often types only the first field of a struct or entry of a table. It is a\n"
+            "threshold, not a hard cap: the item that crosses the line is taken whole,\n"
             "so a range can end past it. The walk also stops early at a named address,\n"
-            "at unmapped memory, or at the end of the segment.\n"
+            "at code, at unmapped memory, or at the end of the segment. Data without a\n"
+            "value (BSS) is not limited: it costs nothing to carry.\n"
             "\n"
             "0 takes only the item at the target address.\n"
             "Raise it when referenced blobs come out truncated; lower it when scans\n"
@@ -1744,9 +1803,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         up by address, so it can never land on a neighbouring segment that
         already existed. Either may be None when the payload did not record it.
 
-        Always ends with update(), even with nothing to apply: that is also what
-        saves the permissions set just before, since ida_domain's
-        set_permissions() changes the segment without calling it."""
+        Always ends with update(), even with nothing to apply: IDA's API asks for
+        it after segment fields change, and ida_domain's set_permissions(), called
+        just before, does not call it."""
         if not s:
             return
         if seg_type is not None:
