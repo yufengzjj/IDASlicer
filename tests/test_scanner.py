@@ -4,7 +4,9 @@ import os
 import types
 
 import ida_bytes
+import ida_fixup
 import ida_funcs
+import ida_offset
 import ida_segment
 import ida_ua
 import ida_xref
@@ -139,6 +141,33 @@ def test_data_pointers(db):
     assert idaslicer._data_pointers(table, table + 16, 8) == {db.ea("via_ptr"): table, db.ea("via_ptr2"): table + 8}
     bss = ida_segment.getseg(db.ea("g_bss"))
     assert idaslicer._data_pointers(bss.start_ea, bss.end_ea, 8) == {}
+
+
+@pytest.fixture
+def raw_table(db):
+    """g_table undefined: its pointers are raw values IDA keeps no xref for."""
+    table = db.ea("g_table")
+    slots = (table, table + 8)
+    flags = [ida_bytes.get_flags(a) for a in slots]
+    assert ida_bytes.del_items(table, ida_bytes.DELIT_SIMPLE, 16)
+    assert not [x for a in range(table, table + 16) for x in idautils.XrefsFrom(a, ida_xref.XREF_DATA)]
+    yield table
+    for a in slots:
+        ida_fixup.del_fixup(a)
+        assert ida_bytes.create_data(a, ida_bytes.FF_QWORD, 8, idaslicer.idaapi.BADADDR)
+        assert ida_offset.op_plain_offset(a, 0, 0)
+    assert [ida_bytes.get_flags(a) for a in slots] == flags
+
+
+def test_raw_pointers_without_fixups(db, raw_table):
+    assert idaslicer._data_pointers(raw_table, raw_table + 16, 8) == {db.ea("via_ptr"): raw_table, db.ea("via_ptr2"): raw_table + 8}
+
+
+def test_raw_pointers_need_fixups_where_the_segment_has_them(db, raw_table):
+    fixup = ida_fixup.fixup_data_t(ida_fixup.FIXUP_OFF64)
+    fixup.off = db.ea("via_ptr2")
+    ida_fixup.set_fixup(raw_table + 8, fixup)
+    assert idaslicer._data_pointers(raw_table, raw_table + 16, 8) == {db.ea("via_ptr2"): raw_table + 8}
 
 
 def test_loose_bss_stops_at_reference(db):

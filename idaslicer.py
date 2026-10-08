@@ -18,6 +18,7 @@ from typing import NamedTuple
 
 import ida_auto
 import ida_bytes
+import ida_fixup
 import ida_funcs
 import ida_hexrays
 import ida_ida
@@ -897,6 +898,12 @@ def check_o_ref_range(
                     ranges.append(r)
 
 
+def _segment_has_fixups(seg) -> bool:
+    if ida_fixup.exists_fixup(seg.start_ea):
+        return True
+    return ida_fixup.get_next_fixup_ea(seg.start_ea) < seg.end_ea
+
+
 def _data_pointers(start: int, end: int, ptr_size: int) -> dict[int, int]:
     """Candidate pointers stored in the data at [start, end), as {target: address
     it was found at}. Two sources, because each misses what the other sees:
@@ -905,11 +912,17 @@ def _data_pointers(start: int, end: int, ptr_size: int) -> dict[int, int]:
       or struct they sit on the element or member, not on the item head, hence
       the walk over every 4-aligned address.
     - Raw values from pointer-aligned slots cover pointers IDA never typed. A
-      lone pointer-sized item is read wherever it sits, aligned or not.
+      lone pointer-sized item is read wherever it sits, aligned or not. Where
+      the image records a fixup for each of its pointers, only slots with one
+      are read: a PE with base relocations does so throughout, other formats
+      in the segments that have any. (In a DLL based at 0x100000000, an RVA
+      followed by a dword 1 reads as a pointer into the image.)
 
     Code, strings and bytes without a value are skipped: the last hold no
     pointer, and reading them would make a large BSS cost a slot per 8 bytes."""
     byteorder = "big" if ida_ida.inf_is_be() else "little"
+    pe_relocated = ida_ida.inf_get_filetype() == ida_ida.f_PE and ida_fixup.get_first_fixup_ea() != idaapi.BADADDR
+    fixups_required = {}
     found = {}
     ea = start
     while ea < end:
@@ -926,10 +939,16 @@ def _data_pointers(start: int, end: int, ptr_size: int) -> dict[int, int]:
             break
         if not (ida_bytes.is_code(flags) or ida_bytes.is_strlit(flags)):
             data, runs = _read_range(ea, item_end - ea)
+            seg = ida_segment.getseg(ea)
+            if seg is not None and seg.start_ea not in fixups_required:
+                fixups_required[seg.start_ea] = pe_relocated or _segment_has_fixups(seg)
+            need_fixup = seg is not None and fixups_required[seg.start_ea]
             for off, n in runs:
                 lo, hi = ea + off, ea + off + n
                 first = lo if hi - lo == ptr_size == item_end - ea else (lo + ptr_size - 1) // ptr_size * ptr_size
                 for slot in range(first, hi - ptr_size + 1, ptr_size):
+                    if need_fixup and not ida_fixup.exists_fixup(slot):
+                        continue
                     found.setdefault(int.from_bytes(data[slot - ea : slot - ea + ptr_size], byteorder), slot)
             if runs and not ida_bytes.is_unknown(flags):
                 for a in [ea, *range((ea + 4) // 4 * 4, item_end, 4)]:
