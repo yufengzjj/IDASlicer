@@ -227,6 +227,30 @@ def test_import_limited_to_ranges(edits):
     assert idaslicer.export_user_data() == before
 
 
+def test_parse_noreturn_function_pointer(db):
+    decl = "void (__cdecl __noreturn *__idaslicer_t)(int a);"
+    assert ida_typeinf.parse_decl(ida_typeinf.tinfo_t(), None, decl, ida_typeinf.PT_SIL) is None, "IDA's parser takes it now"
+    tif = idaslicer._parse_type(decl)
+    assert tif is not None
+    assert idaslicer._type_decl(tif) == "void (__noreturn *__idaslicer_t)(int a);"
+
+
+def test_import_types_ida_cannot_parse(db):
+    """IDA prints anonymous members as types of their own that its parser rejects."""
+    decl = "struct SliceOuter { union { int a; float b; }; struct { int x; int y; }; int c; };"
+    assert ida_typeinf.parse_decls(None, decl, None, ida_typeinf.HTI_DCL) == 0
+    types = idaslicer._export_types({"SliceOuter"})
+    heads = [b.splitlines()[0] for b in idaslicer._type_blocks(types)]
+    anonymous = [h.split(" ", 1)[1] for h in heads if "::$" in h]
+    assert len(anonymous) == 2, heads
+    for name in ["SliceOuter", *anonymous]:
+        assert ida_typeinf.del_named_type(None, name, ida_typeinf.NTF_TYPE)
+    done, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "types": types})
+    assert problems == []
+    assert done["local type"] == 3
+    assert idaslicer._type_blocks(idaslicer._export_types({"SliceOuter"})) == idaslicer._type_blocks(types)
+
+
 def _json(data):
     return json.loads(json.dumps(data))
 

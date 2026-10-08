@@ -1415,6 +1415,9 @@ USERDATA_VERSION = 1
 # A type is stored as a one-line declaration of this name: parse_decl() reads a
 # type back only from a whole declaration.
 _DECL_NAME = "__idaslicer_t"
+# IDA prints a pointer to a noreturn function as `void (__cdecl __noreturn *p)(...)`,
+# which its parser rejects; it does take the function `void __cdecl __noreturn p(...)`.
+_FUNC_PTR_DECL = re.compile(rf"\(([^()*]*)\*{_DECL_NAME}\)")
 _AUTOSAVE_FILE = re.compile(r"\d{8}-\d{6}\.json")
 # print_decls() opens every type with a `/* <ordinal> */` line.
 _TYPE_BLOCK = re.compile(r"(?m)^/\* \d+ \*/$")
@@ -1449,7 +1452,14 @@ def _type_decl(tif) -> str:
 
 def _parse_type(decl: str):
     tif = ida_typeinf.tinfo_t()  # ty:ignore[missing-argument]
-    return tif if ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL) is not None else None  # ty:ignore[invalid-argument-type]
+    if ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL) is not None:  # ty:ignore[invalid-argument-type]
+        return tif
+    func_decl, n = _FUNC_PTR_DECL.subn(rf"\1{_DECL_NAME}", decl, count=1)
+    if n and ida_typeinf.parse_decl(tif, None, func_decl, ida_typeinf.PT_SIL) is not None:
+        ptr = ida_typeinf.tinfo_t()
+        if ptr.create_ptr(tif):
+            return ptr
+    return None
 
 
 def _applied_type(ea: int) -> str:
@@ -1867,9 +1877,16 @@ def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int
     if changed and ida_typeinf.parse_decls(None, "\n".join(changed), None, ida_typeinf.HTI_DCL) == 0:  # ty:ignore[invalid-argument-type]
         done["local type"] += len(changed)
     elif changed:
-        for block in changed:
-            ok = ida_typeinf.parse_decls(None, block, None, ida_typeinf.HTI_DCL) == 0  # ty:ignore[invalid-argument-type]
-            check(ok, "local type", f"IDA cannot parse {block.splitlines()[0]}, so it may be incomplete")
+        failed = [b for b in changed if ida_typeinf.parse_decls(None, b, None, ida_typeinf.HTI_DCL) != 0]  # ty:ignore[invalid-argument-type]
+        done["local type"] += len(changed) - len(failed)
+        # IDA also prints `typedef ... wchar_t;`, a keyword to its parser, and
+        # anonymous members as types of their own named `Outer::$<hash>`. The
+        # other declarations can bring such a type in unchanged, and an anonymous
+        # member is whole inside the declaration of the type that holds it.
+        present = set(_type_blocks(_export_types())) if failed else set()
+        for block in failed:
+            head = block.splitlines()[0]
+            check(block in present or "::$" in head, "local type", f"IDA cannot parse {head}, so it may be incomplete")
 
     # add_func() fails on bytes that are not code yet, as in a fresh slice.
     unexplored = [start + delta for start, _ in data.get("functions", []) if ida_bytes.is_unknown(ida_bytes.get_flags(start + delta))]
