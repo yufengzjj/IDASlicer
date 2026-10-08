@@ -74,6 +74,15 @@ def test_export_entries_leaves_list_alone(db):
     assert out[0].sig != entries[0].sig
 
 
+def test_display_name_demangles_the_symbol(db):
+    shown = "std::bad_array_new_length::bad_array_new_length(void)"
+    assert idaslicer._display_name("_ZNSt20bad_array_new_lengthC2Ev_0x1000", 0x1000) == shown + "_0x1000"
+    assert idaslicer._display_name("_ZNSt20bad_array_new_lengthC2Ev", 0x1000) == shown
+    assert idaslicer._display_name("leaf_0x1000", 0x1000) == "leaf_0x1000"
+    # A suffix that is not this entry's start is part of the name, as typed.
+    assert idaslicer._display_name("_ZNSt20bad_array_new_lengthC2Ev_0x2000", 0x1000) == "_ZNSt20bad_array_new_lengthC2Ev_0x2000"
+
+
 def test_config_round_trip_keeps_other_binaries(db, plugin, tmp_path):
     path = tmp_path / "idaslicer_config.json"
     path.write_text(json.dumps({"entries": {"other": [{"name": "x", "start": 1, "end": 2}]}}))

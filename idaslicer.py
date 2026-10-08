@@ -43,8 +43,10 @@ import traceback
 def run_worker(data_path):
     try:
         import ida_domain
+        import ida_ida
         import ida_segment
         import ida_name
+        import ida_typeinf
     except ImportError:
         print(traceback.format_exc())
         sys.exit(1)
@@ -54,9 +56,17 @@ def run_worker(data_path):
     problems = []
     try:
         with open(data_path, 'rb') as f:
-            out_path, entries_data = pickle.load(f)
+            out_path, cc_id, entries_data = pickle.load(f)
 
         with ida_domain.Database.open(out_path) as db:
+            # IDA demangles with the compiler's demangler: in a GNU template an
+            # MSVC name shows as `__0foo_std__QEAA_XZ`.
+            if cc_id is not None and ida_ida.inf_get_cc_id() != cc_id:
+                cc = ida_ida.compiler_info_t()
+                ida_ida.inf_get_cc(cc)
+                cc.id = cc_id
+                if not ida_typeinf.set_compiler(cc, ida_typeinf.SETCOMP_OVERRIDE):
+                    problems.append(f"compiler: could not set it to {cc_id}, so names may not demangle")
             name_counts = {}
             for entry_data in entries_data:
                 name = entry_data['name']
@@ -279,6 +289,18 @@ def _record_origin(origins: dict, addr: int, ref_from: int | None):
     origins.setdefault(addr, ref_from)
 
 
+def _demangled(name: str) -> str:
+    """`name` demangled the way IDA shows it, or unchanged if it is not mangled."""
+    return ida_name.demangle_name(name, ida_ida.inf_get_short_demnames()) or name
+
+
+def _display_name(name: str, start: int) -> str:
+    """An entry name for the panel: `_range_name` appends `_{hex(start)}` to the
+    symbol, and a mangled symbol no longer demangles with that attached."""
+    base = name.removesuffix(f"_{hex(start)}")
+    return _demangled(base) + name[len(base) :]
+
+
 def _ref_label(ea: int | None) -> str:
     """Render a referrer address for the Ref column: an address, plus where it
     sits if that can be said more usefully than a bare number."""
@@ -289,9 +311,10 @@ def _ref_label(ea: int | None) -> str:
         name = ida_funcs.get_func_name(func.start_ea)
         off = ea - func.start_ea
         if name:
+            name = _demangled(name)
             return f"{hex(ea)} ({name}+{hex(off)})" if off else f"{hex(ea)} ({name})"
     name = ida_name.get_name(ea)
-    return f"{hex(ea)} ({name})" if name else hex(ea)
+    return f"{hex(ea)} ({_demangled(name)})" if name else hex(ea)
 
 
 def get_seg_class(seg_type):
@@ -1116,6 +1139,23 @@ class _SizeItem(QtWidgets.QTableWidgetItem):
         return super().data(role)
 
 
+class _NameItem(QtWidgets.QTableWidgetItem):
+    """Name cell: shows the name demangled but edits the stored one, which is
+    also what becomes the segment name on export."""
+
+    def __init__(self, name, start):
+        shown = _display_name(name, start)
+        super().__init__(shown)
+        self._edit_text = name
+        if shown != name:
+            self.setToolTip(name)
+
+    def data(self, role):
+        if role == QtCore.Qt.ItemDataRole.EditRole:
+            return self._edit_text
+        return super().data(role)
+
+
 class SlicerTable(QtWidgets.QTableWidget):
     COL_NAME, COL_START, COL_END, COL_SIZE, COL_REF, COL_ATTRS, COL_SIG = range(7)
 
@@ -1158,7 +1198,7 @@ class SlicerTable(QtWidgets.QTableWidget):
             self.setRowCount(0)
             for i, entry in enumerate(self.entries):
                 self.insertRow(i)
-                self.setItem(i, self.COL_NAME, QtWidgets.QTableWidgetItem(entry.name))
+                self.setItem(i, self.COL_NAME, _NameItem(entry.name, entry.start))
                 self.setItem(i, self.COL_START, QtWidgets.QTableWidgetItem(hex(entry.start)))
                 self.setItem(i, self.COL_END, QtWidgets.QTableWidgetItem(hex(entry.end)))
                 self.setItem(i, self.COL_SIZE, _SizeItem(entry.size()))
@@ -1252,7 +1292,8 @@ class SlicerTable(QtWidgets.QTableWidget):
             if not hit:
                 for col in range(self.columnCount()):
                     item = self.item(row, col)
-                    if item and needle in item.text().lower():
+                    # EditRole too: a name cell shows the demangled name but edits the mangled one.
+                    if item and (needle in item.text().lower() or needle in str(item.data(QtCore.Qt.ItemDataRole.EditRole)).lower()):
                         hit = True
                         break
             self.setRowHidden(row, not hit)
@@ -2026,7 +2067,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
         try:
             with os.fdopen(data_fd, "wb") as f:
-                pickle.dump((out_path, entries_data), f)
+                pickle.dump((out_path, ida_ida.inf_get_cc_id(), entries_data), f)
 
             with os.fdopen(script_fd, "w") as f:
                 f.write(WORKER_SCRIPT)
