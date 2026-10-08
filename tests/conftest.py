@@ -24,6 +24,7 @@ os.environ["IDAUSR"] = tempfile.mkdtemp(prefix="idaslicer-idausr-")
 
 # Must come before any ida_* import.
 import idapro
+import qt_stub
 
 
 class _StandardButton(enum.Flag):
@@ -105,32 +106,16 @@ class FakeFileDialog:
     def getOpenFileNames(cls, *a):
         return list(cls.files), ""
 
+    @classmethod
+    def getOpenFileName(cls, *a):
+        return (cls.files[0] if cls.files else ""), ""
 
-def _install_qt_stub():
-    """idalib's PySide6 refuses to import outside the GUI. The scanner and the
-    export/import paths need only the few classes defined above; any other name
-    becomes an empty class, which is enough for the module-level UI classes to
-    be defined."""
-    known = {"QMessageBox": FakeMessageBox, "QCheckBox": FakeCheckBox, "QFileDialog": FakeFileDialog}
-    cache = {}
-
-    def lookup(name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-        if name in known:
-            return known[name]
-        return cache.setdefault(name, type(name, (), {}))
-
-    pkg = types.ModuleType("PySide6")
-    widgets = types.ModuleType("PySide6.QtWidgets")
-    core = types.ModuleType("PySide6.QtCore")
-    widgets.__getattr__ = lookup
-    core.__getattr__ = lookup
-    pkg.QtWidgets, pkg.QtCore = widgets, core
-    sys.modules.update({"PySide6": pkg, "PySide6.QtWidgets": widgets, "PySide6.QtCore": core})
+    @classmethod
+    def getSaveFileName(cls, *a):
+        return cls.getOpenFileName()
 
 
-_install_qt_stub()
+qt_stub.install({"QMessageBox": FakeMessageBox, "QCheckBox": FakeCheckBox, "QFileDialog": FakeFileDialog})
 sys.path.insert(0, ROOT)
 
 import idaslicer

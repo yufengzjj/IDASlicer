@@ -3,6 +3,7 @@ import collections
 import contextlib
 import copy
 import hashlib
+import itertools
 import json
 import os
 import pickle
@@ -15,19 +16,27 @@ import time
 from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
+import ida_auto
 import ida_bytes
 import ida_funcs
+import ida_hexrays
 import ida_ida
 import ida_idaapi
 import ida_kernwin
+import ida_lines
+import ida_loader
+import ida_moves
 import ida_nalt
 import ida_name
+import ida_pro
 import ida_range
 import ida_segment
+import ida_typeinf
 import ida_ua
 import ida_xref
 import idaapi
 import idautils
+import idc
 from PySide6 import QtCore, QtWidgets
 
 try:
@@ -45,6 +54,7 @@ def run_worker(data_path):
     try:
         import ida_domain
         import ida_ida
+        import ida_nalt
         import ida_segment
         import ida_name
         import ida_netnode
@@ -58,7 +68,7 @@ def run_worker(data_path):
     problems = []
     try:
         with open(data_path, 'rb') as f:
-            out_path, cc_id, entries_data = pickle.load(f)
+            out_path, cc_id, imagebase, entries_data = pickle.load(f)
 
         with ida_domain.Database.open(out_path) as db:
             # IDA can drop the Root Node while opening (docs/worker-corrupt-i64);
@@ -75,6 +85,10 @@ def run_worker(data_path):
                 cc.id = cc_id
                 if not ida_typeinf.set_compiler(cc, ida_typeinf.SETCOMP_OVERRIDE):
                     problems.append(f"compiler: could not set it to {cc_id}, so names may not demangle")
+            # The slice keeps the source's addresses, so it keeps its image base
+            # too; an analysis export moves addresses by the image-base difference.
+            if imagebase is not None:
+                ida_nalt.set_imagebase(imagebase)
             name_counts = {}
             for entry_data in entries_data:
                 name = entry_data['name']
@@ -443,6 +457,8 @@ def _read_range(ea: int, size: int) -> tuple[bytes | None, list[tuple[int, int]]
 DEFAULT_SETTINGS = {
     "max_explore_len": 128,
     "skip_named_data": False,
+    "autosave_minutes": 0,
+    "autosave_keep": 10,
 }
 SETTINGS = dict(DEFAULT_SETTINGS)
 
@@ -462,6 +478,10 @@ def _apply_stored_settings(stored):
     val = stored.get("skip_named_data")
     if isinstance(val, bool):
         SETTINGS["skip_named_data"] = val
+    for key, low in (("autosave_minutes", 0), ("autosave_keep", 1)):
+        val = stored.get(key)
+        if isinstance(val, int) and not isinstance(val, bool) and val >= low:
+            SETTINGS[key] = val
 
 
 def _ends_unexplored_run(flags) -> bool:
@@ -1146,6 +1166,546 @@ def collect_recursive_ranges_from_ranges(seed_ranges, origins: dict | None = Non
     return collected
 
 
+# --- User analysis backup ---
+
+USERDATA_FORMAT = "idaslicer-userdata"
+USERDATA_VERSION = 1
+# A type is stored as a one-line declaration of this name: parse_decl() reads a
+# type back only from a whole declaration.
+_DECL_NAME = "__idaslicer_t"
+_AUTOSAVE_FILE = re.compile(r"\d{8}-\d{6}\.json")
+# print_decls() opens every type with a `/* <ordinal> */` line.
+_TYPE_BLOCK = re.compile(r"(?m)^/\* \d+ \*/$")
+_AUTOSAVE_TICK_MS = 60_000
+_PROBLEMS_SHOWN = 20
+
+
+class _TextSink(ida_typeinf.text_sink_t):
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+
+    def _print(self, s):
+        self.parts.append(s)
+        return 0
+
+
+def _hr_items(kind: str, m):
+    """(key, value) pairs of a Hex-Rays map such as user_labels_t; most of them have no items()."""
+    if m is None:
+        return
+    first, second, nxt, end = (getattr(ida_hexrays, f"{kind}_{n}") for n in ("first", "second", "next", "end"))
+    it = getattr(ida_hexrays, f"{kind}_begin")(m)
+    while it != end(m):
+        yield first(it), second(it)
+        it = nxt(it)
+
+
+def _type_decl(tif) -> str:
+    return tif._print(_DECL_NAME, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_SEMI)
+
+
+def _parse_type(decl: str):
+    tif = ida_typeinf.tinfo_t()  # ty:ignore[missing-argument]
+    return tif if ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL) is not None else None  # ty:ignore[invalid-argument-type]
+
+
+def _applied_type(ea: int) -> str:
+    tif = ida_typeinf.tinfo_t()  # ty:ignore[missing-argument]
+    ida_nalt.get_tinfo(tif, ea)
+    return _type_decl(tif)
+
+
+def _char(v) -> int:
+    # number_format_t's char fields read back as 1-character strings.
+    return ord(v) if isinstance(v, str) else v
+
+
+def _loc_to_json(loc) -> list | None:
+    t = loc.atype()
+    if t == ida_typeinf.ALOC_STACK:
+        return ["stack", loc.stkoff()]
+    if t == ida_typeinf.ALOC_REG1 and loc.regoff() == 0:
+        return ["reg1", loc.reg1()]
+    if t == ida_typeinf.ALOC_REG2:
+        return ["reg2", loc.reg1(), loc.reg2()]
+    if t == ida_typeinf.ALOC_STATIC:
+        return ["ea", loc.get_ea()]
+    return None
+
+
+def _loc_from_json(j: list, delta: int):
+    loc = ida_hexrays.vdloc_t()  # ty:ignore[missing-argument]
+    if j[0] == "stack":
+        loc.set_stkoff(j[1])
+    elif j[0] == "reg1":
+        loc.set_reg1(j[1])
+    elif j[0] == "reg2":
+        loc.set_reg2(j[1], j[2])
+    elif j[0] == "ea":
+        loc.set_ea(j[1] + delta)
+    else:
+        return None
+    return loc
+
+
+def _export_types() -> list[str]:
+    til = ida_typeinf.get_idati()
+    ordinals = list(range(1, ida_typeinf.get_ordinal_limit(til)))
+    if not ordinals:
+        return []
+    sink = _TextSink()  # ty:ignore[missing-argument]
+    ida_typeinf.print_decls(sink, til, ordinals, ida_typeinf.PDF_INCL_DEPS | ida_typeinf.PDF_DEF_FWD)
+    return "".join(sink.parts).splitlines()
+
+
+def _type_blocks(lines: list[str]) -> list[str]:
+    """The declarations in print_decls() output, without their ordinal lines."""
+    return [b.strip() for b in _TYPE_BLOCK.split("\n".join(lines)) if b.strip()]
+
+
+def _export_functions(out: dict):
+    for start in idautils.Functions():
+        pfn = ida_funcs.get_func(start)
+        if pfn is None:
+            continue
+        out["functions"].append([start, pfn.end_ea])
+        for rpt in (False, True):
+            text = ida_funcs.get_func_cmt(pfn, rpt)
+            if text:
+                out["func_comments"].append([start, rpt, text])
+
+
+def _export_heads(out: dict):
+    shifts = [ida_bytes.get_operand_type_shift(n) for n in range(ida_ida.UA_MAXOP)]
+    op_mask = 0
+    for shift in shifts:
+        op_mask |= ida_bytes.MS_N_TYPE << shift
+    names = {}
+    for ea in idautils.Heads():
+        f = ida_bytes.get_flags(ea)
+        if ida_bytes.has_user_name(f):
+            # A local label has no global name.
+            names[ea] = [ea, ida_name.get_ea_name(ea, ida_name.GN_LOCAL), not ida_name.get_ea_name(ea, 0)]
+        if ida_bytes.has_cmt(f):
+            for rpt in (False, True):
+                text = ida_bytes.get_cmt(ea, rpt)
+                if text:
+                    out["comments"].append([ea, rpt, text])
+        if ida_bytes.has_extra_cmts(f):
+            for prev, base in ((True, ida_lines.E_PREV), (False, ida_lines.E_NEXT)):
+                lines = []
+                while (line := ida_lines.get_extra_cmt(ea, base + len(lines))) is not None:
+                    lines.append(line)
+                if lines:
+                    out["extra_comments"].append([ea, prev, lines])
+        # Functions, data, and call instructions given a call type.
+        if ida_nalt.is_userti(ea):
+            out["applied_types"].append([ea, _applied_type(ea)])
+        if not f & op_mask:
+            continue
+        for n, shift in enumerate(shifts):
+            kind = (f >> shift) & ida_bytes.MS_N_TYPE
+            if kind == ida_bytes.FF_N_ENUM:
+                tid, serial = ida_bytes.get_enum_id(ea, n)
+                out["operands"].append([ea, n, "enum", ida_typeinf.get_tid_name(tid), serial])
+            elif kind == ida_bytes.FF_N_STRO:
+                path, delta = ida_bytes.get_stroff_path(ea, n)  # ty:ignore[too-many-positional-arguments]
+                if path:
+                    out["operands"].append([ea, n, "stroff", [ida_typeinf.get_tid_name(t) for t in path], delta])
+            elif kind == ida_bytes.FF_N_FOP:
+                text = ida_bytes.get_forced_operand(ea, n)
+                if text is not None:
+                    out["operands"].append([ea, n, "forced", text])
+    # Names on bytes that are not item heads, e.g. unexplored ones.
+    for ea, name in idautils.Names():
+        if ea not in names and ida_bytes.has_user_name(ida_bytes.get_flags(ea)):
+            names[ea] = [ea, name, False]
+    out["names"] = [names[ea] for ea in sorted(names)]
+
+
+def _export_patches(out: dict):
+    runs = []
+
+    def visit(ea, fpos, original, value):
+        if runs and runs[-1][0] + len(runs[-1][1]) == ea:
+            runs[-1][1].append(original)
+            runs[-1][2].append(value)
+        else:
+            runs.append([ea, [original], [value]])
+        return 0
+
+    ida_bytes.visit_patched_bytes(0, ida_idaapi.BADADDR, visit)
+    out["patches"] = [[ea, bytes(orig).hex(), bytes(val).hex()] for ea, orig, val in runs]
+
+
+def _export_bookmarks(out: dict):
+    for slot in range(ida_moves.MAX_MARK_SLOT + 1):
+        ea = idc.get_bookmark(slot)
+        if ea is not None and ea != ida_idaapi.BADADDR:
+            out["bookmarks"].append([slot, ea, idc.get_bookmark_desc(slot) or ""])
+
+
+def _export_lvars(ea: int, out: dict) -> dict | None:
+    info = ida_hexrays.lvar_uservec_t()  # ty:ignore[missing-argument]
+    if not ida_hexrays.restore_user_lvar_settings(info, ea):
+        return None
+    lvars = []
+    for s in info.lvvec:
+        loc = _loc_to_json(s.ll.location)
+        if loc is None:
+            out["not_exported"].append(f"{hex(ea)}: decompiler variable {s.name!r} sits in a location this format cannot describe")
+            continue
+        lvars.append(
+            {
+                "loc": loc,
+                "defea": s.ll.defea,
+                "name": s.name,
+                "type": None if s.type.empty() else _type_decl(s.type),
+                "cmt": s.cmt,
+                "size": s.size,
+                "flags": s.flags,
+            }
+        )
+    lmaps = []
+    for src, dst in _hr_items("lvar_mapping", info.lmaps):
+        src_loc, dst_loc = _loc_to_json(src.location), _loc_to_json(dst.location)
+        if src_loc is not None and dst_loc is not None:
+            lmaps.append([src_loc, src.defea, dst_loc, dst.defea])
+    return {"vars": lvars, "lmaps": lmaps, "stkoff_delta": info.stkoff_delta, "flags": info.ulv_flags}
+
+
+def _export_udcalls(ea: int) -> list:
+    """Call types set in the decompiler ("Set call type")."""
+    calls = ida_hexrays.udcall_map_new()
+    if not ida_hexrays.restore_user_defined_calls(calls, ea):
+        return []
+    return [[cea, c.name, _type_decl(c.tif)] for cea, c in _hr_items("udcall_map", calls)]
+
+
+def _export_decompiler(func_starts: list[int], out: dict) -> list | None:
+    if not ida_hexrays.init_hexrays_plugin():
+        return None
+    funcs = []
+    for ea in func_starts:
+        item = {}
+        lvars = _export_lvars(ea, out)
+        if lvars is not None:
+            item["lvars"] = lvars
+        parts = {
+            "comments": [[k.ea, k.itp, str(v)] for k, v in _hr_items("user_cmts", ida_hexrays.restore_user_cmts(ea))],
+            "labels": [[k, v] for k, v in _hr_items("user_labels", ida_hexrays.restore_user_labels(ea))],
+            "numforms": [
+                [k.ea, k.opnum, v.flags, _char(v.opnum), _char(v.props), v.serial, _char(v.org_nbytes), v.type_name]
+                for k, v in _hr_items("user_numforms", ida_hexrays.restore_user_numforms(ea))
+            ],
+            "iflags": [[k.ea, k.op, v] for k, v in _hr_items("user_iflags", ida_hexrays.restore_user_iflags(ea))],
+            "unions": [[k, list(v)] for k, v in _hr_items("user_unions", ida_hexrays.restore_user_unions(ea))],
+            "calls": _export_udcalls(ea),
+        }
+        item.update({k: v for k, v in parts.items() if v})
+        if item:
+            funcs.append({"ea": ea, **item})
+    return funcs
+
+
+def export_user_data() -> dict:
+    """What the user added to the analysis -- patched bytes, names, types,
+    comments, operand representation, bookmarks and decompiler edits -- for
+    import_user_data() to apply to a fresh database of the same binary. Local
+    types go out whole: IDA does not record which of them the user wrote."""
+    md5 = ida_nalt.retrieve_input_file_md5()
+    out = {
+        "format": USERDATA_FORMAT,
+        "version": USERDATA_VERSION,
+        "input_file": ida_nalt.get_root_filename(),
+        "input_md5": md5.hex() if md5 else None,
+        "imagebase": ida_nalt.get_imagebase(),
+        "not_exported": [],
+        "types": _export_types(),
+        "patches": [],
+        "functions": [],
+        "names": [],
+        "applied_types": [],
+        "comments": [],
+        "extra_comments": [],
+        "func_comments": [],
+        "operands": [],
+        "bookmarks": [],
+        "decompiler": None,
+    }
+    _export_patches(out)
+    _export_functions(out)
+    _export_heads(out)
+    _export_bookmarks(out)
+    out["decompiler"] = _export_decompiler([start for start, _ in out["functions"]], out)
+    return out
+
+
+def _import_decompiler(item: dict, delta: int, check):
+    ea = item["ea"] + delta
+    lv = item.get("lvars")
+    if lv is not None:
+        info = ida_hexrays.lvar_uservec_t()  # ty:ignore[missing-argument]
+        for v in lv["vars"]:
+            s = ida_hexrays.lvar_saved_info_t()  # ty:ignore[missing-argument]
+            s.ll = ida_hexrays.lvar_locator_t(_loc_from_json(v["loc"], delta), v["defea"] + delta)
+            s.name, s.cmt, s.size, s.flags = v["name"], v["cmt"], v["size"], v["flags"]
+            if v["type"]:
+                tif = _parse_type(v["type"])
+                if check(tif is not None, "decompiler variable type", f"{hex(ea)} {v['name']}: {v['type']}"):
+                    s.type = tif
+            info.lvvec.push_back(s)
+        for src_loc, src_def, dst_loc, dst_def in lv["lmaps"]:
+            src = ida_hexrays.lvar_locator_t(_loc_from_json(src_loc, delta), src_def + delta)
+            dst = ida_hexrays.lvar_locator_t(_loc_from_json(dst_loc, delta), dst_def + delta)
+            ida_hexrays.lvar_mapping_insert(info.lmaps, src, dst)
+        info.stkoff_delta, info.ulv_flags = lv["stkoff_delta"], lv["flags"]
+        ida_hexrays.save_user_lvar_settings(ea, info)
+    if "comments" in item:
+        cmts = ida_hexrays.user_cmts_new()
+        for cea, itp, text in item["comments"]:
+            loc = ida_hexrays.treeloc_t()  # ty:ignore[missing-argument]
+            loc.ea, loc.itp = cea + delta, itp
+            ida_hexrays.user_cmts_insert(cmts, loc, ida_hexrays.citem_cmt_t(text))  # ty:ignore[missing-argument]
+        ida_hexrays.save_user_cmts(ea, cmts)
+    if "labels" in item:
+        labels = ida_hexrays.user_labels_new()
+        for num, text in item["labels"]:
+            ida_hexrays.user_labels_insert(labels, num, text)
+        ida_hexrays.save_user_labels(ea, labels)
+    if "numforms" in item:
+        numforms = ida_hexrays.user_numforms_new()
+        for nea, opnum, flags, nf_opnum, props, serial, org_nbytes, type_name in item["numforms"]:
+            fmt = ida_hexrays.number_format_t()  # ty:ignore[missing-argument]
+            fmt.flags, fmt.opnum, fmt.props, fmt.serial = flags, chr(nf_opnum), chr(props), serial
+            fmt.org_nbytes, fmt.type_name = chr(org_nbytes), type_name
+            ida_hexrays.user_numforms_insert(numforms, ida_hexrays.operand_locator_t(nea + delta, opnum), fmt)
+        ida_hexrays.save_user_numforms(ea, numforms)
+    if "iflags" in item:
+        iflags = ida_hexrays.user_iflags_new()
+        for iea, op, value in item["iflags"]:
+            ida_hexrays.user_iflags_insert(iflags, ida_hexrays.citem_locator_t(iea + delta, op), value)
+        ida_hexrays.save_user_iflags(ea, iflags)
+    if "unions" in item:
+        unions = ida_hexrays.user_unions_new()
+        for uea, path in item["unions"]:
+            vec = ida_pro.intvec_t()  # ty:ignore[missing-argument]
+            for i in path:
+                vec.push_back(i)
+            ida_hexrays.user_unions_insert(unions, uea + delta, vec)
+        ida_hexrays.save_user_unions(ea, unions)
+    if "calls" in item:
+        calls = ida_hexrays.udcall_map_new()
+        for cea, name, decl in item["calls"]:
+            call = ida_hexrays.udcall_t()  # ty:ignore[missing-argument]
+            if check(ida_hexrays.parse_user_call(call, decl, True), "decompiler call type", f"{hex(cea + delta)}: {decl}"):
+                call.name = name
+                ida_hexrays.udcall_map_insert(calls, cea + delta, call)
+        ida_hexrays.save_user_defined_calls(ea, calls)
+    ida_hexrays.mark_cfunc_dirty(ea)
+    check(True, "decompiler function", hex(ea))
+
+
+def shift_by_image_base(data: dict) -> bool | None:
+    """Whether an export's addresses should move by the image-base difference:
+    yes for a database rebuilt or rebased since, no for one made in a slice by
+    an older IDASlicer, which kept the source's addresses but not its image
+    base. Decided by which choice puts more exported function starts on
+    function starts here; None when that does not settle it."""
+    delta = ida_nalt.get_imagebase() - data["imagebase"]
+    if delta == 0:
+        return True
+
+    def hits(d):
+        return sum(1 for start, _ in data.get("functions", []) if (pfn := ida_funcs.get_func(start + d)) is not None and pfn.start_ea == start + d)
+
+    shifted, kept = hits(delta), hits(0)
+    if shifted > 2 * kept:
+        return True
+    if kept > 2 * shifted:
+        return False
+    return None
+
+
+def import_user_data(data: dict, shift: bool = True) -> tuple[collections.Counter, list[str]]:
+    """Apply an export_user_data() result to the open database; what the file
+    holds wins over what is there. With `shift`, addresses move by the change
+    in image base (see shift_by_image_base). Returns how many items of each
+    kind were applied, and what failed."""
+    delta = ida_nalt.get_imagebase() - data["imagebase"] if shift else 0
+    done = collections.Counter()
+    problems = []
+
+    def check(ok, kind: str, what: str) -> bool:
+        if ok:
+            done[kind] += 1
+        else:
+            problems.append(f"{kind}: {what}")
+        return bool(ok)
+
+    # First, so that everything after sees the patched code and data.
+    for ea, original, patched in data.get("patches", []):
+        ea += delta
+        original, patched = bytes.fromhex(original), bytes.fromhex(patched)
+        found = bytes(ida_bytes.get_original_byte(ea + i) for i in range(len(original)))
+        if check(found == original, "patch", f"{hex(ea)}: the original bytes are {found.hex()} here, not {original.hex()}"):
+            ida_bytes.patch_bytes(ea, patched)
+
+    # Only declarations that differ from the database's own are parsed: IDA
+    # prints some types its parser rejects (`short float` in the ARM SVE types),
+    # and a rejected declaration still replaces the type with what parsed.
+    # Hex-Rays adds those types on its first decompilation, so let it first.
+    if ida_hexrays.init_hexrays_plugin():
+        for start in itertools.islice(idautils.Functions(), 10):
+            if ida_hexrays.decompile(start, ida_hexrays.hexrays_failure_t()) is not None:  # ty:ignore[missing-argument]
+                break
+    current = set(_type_blocks(_export_types()))
+    changed = [b for b in _type_blocks(data.get("types") or []) if b not in current]
+    if changed and ida_typeinf.parse_decls(None, "\n".join(changed), None, ida_typeinf.HTI_DCL) == 0:  # ty:ignore[invalid-argument-type]
+        done["local type"] += len(changed)
+    elif changed:
+        for block in changed:
+            ok = ida_typeinf.parse_decls(None, block, None, ida_typeinf.HTI_DCL) == 0  # ty:ignore[invalid-argument-type]
+            check(ok, "local type", f"IDA cannot parse {block.splitlines()[0]}, so it may be incomplete")
+
+    for start, end in data.get("functions", []):
+        start, end = start + delta, end + delta
+        pfn = ida_funcs.get_func(start)
+        if pfn is None or pfn.start_ea != start:
+            check(ida_funcs.add_func(start, end), "function", f"cannot create {hex(start)}-{hex(end)}")  # ty:ignore[too-many-positional-arguments]
+        elif pfn.end_ea != end:
+            check(ida_funcs.set_func_end(start, end), "function", f"cannot move the end of {hex(start)} to {hex(end)}")
+
+    for ea, name, local in data.get("names", []):
+        ea += delta
+        flags = ida_name.SN_NOCHECK | ida_name.SN_NOWARN | (ida_name.SN_LOCAL if local else 0)
+        if ida_name.set_name(ea, name, flags):
+            done["name"] += 1
+        elif ida_name.set_name(ea, name, flags | ida_name.SN_FORCE):
+            done["name"] += 1
+            problems.append(f"name: {name} is taken, so {hex(ea)} is now {ida_name.get_ea_name(ea, ida_name.GN_LOCAL)}")
+        else:
+            problems.append(f"name: cannot name {hex(ea)} {name}")
+
+    for ea, decl in data.get("applied_types", []):
+        ea += delta
+        tif = _parse_type(decl)
+        # On a call instruction apply_tinfo() sets the type yet reports failure.
+        ok = tif is not None and (ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE) or _applied_type(ea) == decl)
+        check(ok, "type at address", f"{hex(ea)}: {decl}")
+
+    for ea, n, kind, *args in data.get("operands", []):
+        ea += delta
+        if kind == "enum":
+            tid = ida_typeinf.get_named_type_tid(args[0])
+            ok = tid != ida_idaapi.BADADDR and ida_bytes.op_enum(ea, n, tid, args[1])
+        elif kind == "stroff":
+            path = [ida_typeinf.get_named_type_tid(t) for t in args[0]]
+            insn = ida_ua.insn_t()  # ty:ignore[missing-argument]
+            ok = ida_idaapi.BADADDR not in path and ida_ua.decode_insn(insn, ea) > 0 and ida_bytes.op_stroff(insn, n, path, args[1])  # ty:ignore[too-many-positional-arguments]
+        elif kind == "forced":
+            ok = ida_bytes.set_forced_operand(ea, n, args[0])
+        else:
+            ok = False
+        check(ok, "operand", f"{hex(ea)} operand {n}: {kind} {args}")
+
+    for ea, rpt, text in data.get("comments", []):
+        check(ida_bytes.set_cmt(ea + delta, text, rpt), "comment", hex(ea + delta))
+    for ea, prev, lines in data.get("extra_comments", []):
+        ea += delta
+        base = ida_lines.E_PREV if prev else ida_lines.E_NEXT
+        ida_lines.delete_extra_cmts(ea, base)
+        for i, line in enumerate(lines):
+            ida_lines.update_extra_cmt(ea, base + i, line)
+        done["extra comment lines"] += len(lines)
+    for ea, rpt, text in data.get("func_comments", []):
+        pfn = ida_funcs.get_func(ea + delta)
+        check(pfn is not None and ida_funcs.set_func_cmt(pfn, text, rpt), "function comment", hex(ea + delta))
+
+    for slot, ea, desc in data.get("bookmarks", []):
+        idc.put_bookmark(ea + delta, 0, 0, 0, slot, desc)
+        done["bookmark"] += 1
+
+    funcs = data.get("decompiler") or []
+    if funcs and not ida_hexrays.init_hexrays_plugin():
+        problems.append(f"decompiler: not available, so the decompiler edits of {len(funcs)} function(s) were skipped")
+    else:
+        for item in funcs:
+            _import_decompiler(item, delta, check)
+    return done, problems
+
+
+def format_user_data(data: dict) -> str:
+    """JSON with one list item per line, so two exports diff line by line."""
+    parts = []
+    for key, value in data.items():
+        if isinstance(value, list) and value:
+            items = ",\n".join("  " + json.dumps(v, ensure_ascii=False) for v in value)
+            parts.append(f" {json.dumps(key)}: [\n{items}\n ]")
+        else:
+            parts.append(f" {json.dumps(key)}: {json.dumps(value, ensure_ascii=False)}")
+    return "{\n" + ",\n".join(parts) + "\n}\n"
+
+
+def write_user_data(path: str, text: str):
+    """Through a temporary file, so a crash while writing leaves the previous export intact."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def load_user_data(path: str) -> dict:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or data.get("format") != USERDATA_FORMAT:
+        raise ValueError(f"{path} is not an IDASlicer analysis export")
+    if data.get("version") != USERDATA_VERSION:
+        raise ValueError(f"{path} has format version {data.get('version')}; this plugin reads version {USERDATA_VERSION}")
+    return data
+
+
+def save_rotating(folder: str, text: str, keep: int) -> str | None:
+    """Write text to folder as <time>.json unless the newest file there already
+    holds it, then delete all but the `keep` newest. Returns the new file, if any."""
+    os.makedirs(folder, exist_ok=True)
+    old = sorted(f for f in os.listdir(folder) if _AUTOSAVE_FILE.fullmatch(f))
+    if old:
+        with open(os.path.join(folder, old[-1]), encoding="utf-8") as f:
+            if f.read() == text:
+                return None
+    name = time.strftime("%Y%m%d-%H%M%S") + ".json"
+    path = os.path.join(folder, name)
+    write_user_data(path, text)
+    for f in sorted({*old, name})[:-keep]:
+        os.remove(os.path.join(folder, f))
+    return path
+
+
+def _userdata_counts(data: dict) -> str:
+    labels = {
+        "patches": "patched byte runs",
+        "functions": "functions",
+        "names": "names",
+        "applied_types": "types at addresses",
+        "comments": "comments",
+        "extra_comments": "extra comment blocks",
+        "func_comments": "function comments",
+        "operands": "operand representations",
+        "bookmarks": "bookmarks",
+    }
+    parts = [f"{len(data[key])} {label}" for key, label in labels.items()]
+    parts.append(f"{sum(bool(_TYPE_BLOCK.fullmatch(line)) for line in data['types'])} local types")
+    dec = data["decompiler"]
+    parts.append("no decompiler" if dec is None else f"decompiler edits in {len(dec)} functions")
+    return ", ".join(parts)
+
+
+def _autosave_dir() -> str:
+    return os.path.splitext(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))[0] + ".userdata"
+
+
 # --- UI Components ---
 
 
@@ -1542,8 +2102,8 @@ class SlicerTable(QtWidgets.QTableWidget):
 
 
 class SettingsDialog(QtWidgets.QDialog):
-    """Scanner tuning, kept out of the entry Edit dialog because these apply to
-    the scan itself rather than to any one range."""
+    """Scanner tuning and the analysis auto-export, kept out of the entry Edit
+    dialog because none of it applies to any one range."""
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -1584,6 +2144,24 @@ class SettingsDialog(QtWidgets.QDialog):
         hint.setEnabled(False)
         layout.addRow(hint)
 
+        self.autosave_spin = QtWidgets.QSpinBox()
+        self.autosave_spin.setRange(0, 24 * 60)
+        self.autosave_spin.setSuffix(" min")
+        self.autosave_spin.setSpecialValueText("Off")
+        self.autosave_spin.setValue(SETTINGS["autosave_minutes"])
+        self.autosave_spin.setToolTip(
+            "Export your names, types, comments and decompiler edits to a folder next\n"
+            "to the database (<database>.userdata) this often, so they survive a\n"
+            "database IDA can no longer open. Skipped while auto-analysis runs, and\n"
+            "when nothing changed since the last export."
+        )
+        self.keep_spin = QtWidgets.QSpinBox()
+        self.keep_spin.setRange(1, 1000)
+        self.keep_spin.setValue(SETTINGS["autosave_keep"])
+        self.keep_spin.setToolTip("Older automatic exports are deleted. Exports made with the panel button are never deleted.")
+        layout.addRow("Auto-export analysis every:", self.autosave_spin)
+        layout.addRow("Automatic exports to keep:", self.keep_spin)
+
         standard = QtWidgets.QDialogButtonBox.StandardButton
         buttons = QtWidgets.QDialogButtonBox(_qt_flags(standard.Ok, standard.Cancel, standard.RestoreDefaults))
         buttons.accepted.connect(self.accept)
@@ -1594,11 +2172,15 @@ class SettingsDialog(QtWidgets.QDialog):
     def restore_defaults(self):
         self.explore_spin.setValue(DEFAULT_SETTINGS["max_explore_len"])
         self.skip_named_check.setChecked(DEFAULT_SETTINGS["skip_named_data"])
+        self.autosave_spin.setValue(DEFAULT_SETTINGS["autosave_minutes"])
+        self.keep_spin.setValue(DEFAULT_SETTINGS["autosave_keep"])
 
     def values(self):
         return {
             "max_explore_len": self.explore_spin.value(),
             "skip_named_data": self.skip_named_check.isChecked(),
+            "autosave_minutes": self.autosave_spin.value(),
+            "autosave_keep": self.keep_spin.value(),
         }
 
 
@@ -1650,6 +2232,18 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         seg_layout.addWidget(self.import_seg_button)
         seg_layout.addStretch(1)
         self.layout.addLayout(seg_layout)
+
+        analysis_layout = QtWidgets.QHBoxLayout()
+        self.export_analysis_button = QtWidgets.QPushButton("Export user analysis...")
+        self.export_analysis_button.setToolTip("Save your names, types, comments and decompiler edits to a file")
+        self.export_analysis_button.clicked.connect(self.plugin.export_analysis)
+        analysis_layout.addWidget(self.export_analysis_button)
+        self.import_analysis_button = QtWidgets.QPushButton("Import user analysis...")
+        self.import_analysis_button.setToolTip("Apply an exported analysis to this database, e.g. one rebuilt after a crash")
+        self.import_analysis_button.clicked.connect(self.plugin.import_analysis)
+        analysis_layout.addWidget(self.import_analysis_button)
+        analysis_layout.addStretch(1)
+        self.layout.addLayout(analysis_layout)
 
     def on_settings_clicked(self):
         dialog = SettingsDialog(self.parent)
@@ -1771,6 +2365,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.register_actions()
         self.hooks = SlicerUIHooks(self)  # ty:ignore[missing-argument]
         self.hooks.hook()
+        self._last_autosave = time.monotonic()
+        self._autosave_timer = ida_kernwin.register_timer(_AUTOSAVE_TICK_MS, self._autosave_tick)
         return ida_idaapi.PLUGIN_KEEP
 
     def _get_config_path(self):
@@ -1832,6 +2428,100 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.unregister_actions()
         if hasattr(self, "hooks"):
             self.hooks.unhook()
+        if getattr(self, "_autosave_timer", None):
+            ida_kernwin.unregister_timer(self._autosave_timer)
+
+    def _autosave_tick(self) -> int:
+        minutes = SETTINGS["autosave_minutes"]
+        if minutes and time.monotonic() - self._last_autosave >= minutes * 60 and ida_auto.auto_is_ok():
+            self._last_autosave = time.monotonic()
+            try:
+                path = save_rotating(_autosave_dir(), format_user_data(export_user_data()), SETTINGS["autosave_keep"])
+            except Exception as e:  # noqa: BLE001 -- the timer must keep running
+                print(f"[IDASlicer] Analysis auto-export failed: {e}")
+            else:
+                if path:
+                    print(f"[IDASlicer] Analysis auto-exported to {path}")
+        return _AUTOSAVE_TICK_MS
+
+    def export_analysis(self):
+        default = os.path.splitext(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))[0] + ".userdata.json"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(None, "Export user analysis", default, "Analysis export (*.json)")
+        if not path:
+            return
+        ida_kernwin.show_wait_box("Exporting user analysis...")
+        try:
+            data = export_user_data()
+            write_user_data(path, format_user_data(data))
+        except Exception as e:  # noqa: BLE001
+            print(f"[IDASlicer] Analysis export failed: {e}")
+            QtWidgets.QMessageBox.critical(None, "Export failed", str(e))
+            return
+        finally:
+            ida_kernwin.hide_wait_box()
+        summary = f"Exported to {path}:\n{_userdata_counts(data)}"
+        if data["not_exported"]:
+            summary += "\n\nNot exported:\n" + "\n".join(data["not_exported"])
+        print(f"[IDASlicer] {summary}")
+        QtWidgets.QMessageBox.information(None, "Analysis exported", summary)
+
+    def import_analysis(self):
+        start_dir = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(None, "Import user analysis", start_dir, "Analysis export (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            data = load_user_data(path)
+        except (OSError, ValueError) as e:
+            QtWidgets.QMessageBox.critical(None, "Import failed", str(e))
+            return
+        md5 = ida_nalt.retrieve_input_file_md5()
+        if data.get("input_md5") and md5 and data["input_md5"] != md5.hex():
+            answer = QtWidgets.QMessageBox.question(
+                None,
+                "Different binary",
+                f"{os.path.basename(path)} was exported from {data.get('input_file')}, not from this binary "
+                f"({ida_nalt.get_root_filename()}). That is expected for a slice of it. Import it anyway?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        if not ida_auto.auto_is_ok():
+            answer = QtWidgets.QMessageBox.question(
+                None,
+                "Analysis still running",
+                "IDA is still analysing this database, and what it finds later can replace imported function bounds and types. Import anyway?",
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        delta = ida_nalt.get_imagebase() - data["imagebase"]
+        shift = shift_by_image_base(data)
+        if shift is None:
+            answer = QtWidgets.QMessageBox.question(
+                None,
+                "Image base differs",
+                f"{os.path.basename(path)} was exported with image base {data['imagebase']:#x}, this database has "
+                f"{ida_nalt.get_imagebase():#x}, and its functions do not tell which applies.\n\n"
+                f"Yes: move every address by {delta:#x} (this database was rebuilt or rebased).\n"
+                "No: keep the addresses (the file comes from a slice made by an older IDASlicer, "
+                "which kept the addresses but not the image base).",
+            )
+            shift = answer == QtWidgets.QMessageBox.StandardButton.Yes
+        ida_kernwin.show_wait_box("Importing user analysis...")
+        try:
+            done, problems = import_user_data(data, shift)
+        finally:
+            ida_kernwin.hide_wait_box()
+        lines = [f"Applied from {path}:"]
+        if delta:
+            lines.append(f"  addresses moved by {delta:#x} for the new image base" if shift else "  addresses kept, image base ignored")
+        lines += [f"  {kind}: {n}" for kind, n in sorted(done.items())]
+        print("[IDASlicer] " + "\n".join(lines + problems))
+        if problems:
+            shown = problems[:_PROBLEMS_SHOWN]
+            lines += ["", f"{len(problems)} item(s) could not be applied (all are listed in the Output window):", *shown]
+            if len(problems) > len(shown):
+                lines.append("...")
+        QtWidgets.QMessageBox.information(None, "Analysis imported", "\n".join(lines))
 
     def run(self, arg):
         self.load_config()
@@ -2124,7 +2814,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
         try:
             with os.fdopen(data_fd, "wb") as f:
-                pickle.dump((out_path, ida_ida.inf_get_cc_id(), entries_data), f)
+                pickle.dump((out_path, ida_ida.inf_get_cc_id(), ida_nalt.get_imagebase(), entries_data), f)
 
             with os.fdopen(script_fd, "w") as f:
                 f.write(WORKER_SCRIPT)

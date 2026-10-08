@@ -28,6 +28,7 @@ def main(path, ranges):
         sys.exit(f"cannot open {path}")
     import ida_bytes
     import ida_ida
+    import ida_nalt
     import ida_name
     import ida_segment
     import idautils
@@ -37,6 +38,7 @@ def main(path, ranges):
         "filetype": ida_ida.inf_get_filetype(),
         "is_64": ida_ida.inf_is_64bit(),
         "cc_id": ida_ida.inf_get_cc_id(),
+        "imagebase": ida_nalt.get_imagebase(),
         "segments": [],
         "ranges": [],
         "names": {},

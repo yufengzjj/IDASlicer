@@ -6,6 +6,7 @@ import sys
 
 import ida_bytes
 import ida_ida
+import ida_nalt
 import ida_segment
 import ida_typeinf
 import pytest
@@ -54,6 +55,7 @@ def test_perform_slice(db, plugin, qt, worker_runs):
     assert not os.path.exists(argv[1]) and not os.path.exists(argv[2]), "temp files left behind"
 
     out = inspect(db.path.with_name("scan_arm64_slice.i64"), [(e.start, e.end) for e in entries])
+    assert out["imagebase"] == ida_nalt.get_imagebase()
     segs = {(s["start"], s["end"]): s for s in out["segments"]}
     for e, got in zip(entries, out["ranges"]):
         seg = segs[(e.start, e.end)]
@@ -102,8 +104,9 @@ def test_perform_slice_sends_the_compiler(db, plugin, qt, monkeypatch):
     monkeypatch.setattr(idaslicer.subprocess, "run", run)
     leaf = db.ea("leaf")
     plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
-    ((_, cc_id, _),) = sent
+    ((_, cc_id, imagebase, _),) = sent
     assert cc_id == ida_ida.inf_get_cc_id()
+    assert imagebase == ida_nalt.get_imagebase()
 
 
 @pytest.mark.parametrize("template", sorted(f.removesuffix(".i64") for f in os.listdir(os.path.dirname(TEMPLATE)) if f.endswith(".i64")))
@@ -122,9 +125,9 @@ def test_template_matches_its_name(template, tmp_path):
         assert res["cc_id"] == ida_typeinf.COMP_MS
 
 
-def _run_worker(tmp_path, out, entries_data, cc_id=None):
+def _run_worker(tmp_path, out, entries_data, cc_id=None, imagebase=None):
     data = tmp_path / "data.pickle"
-    data.write_bytes(pickle.dumps((str(out), cc_id, entries_data)))
+    data.write_bytes(pickle.dumps((str(out), cc_id, imagebase, entries_data)))
     script = tmp_path / "worker.py"
     script.write_text(idaslicer.WORKER_SCRIPT)
     return subprocess.run([sys.executable, str(script), str(data)], capture_output=True, text=True, timeout=300, check=False)
