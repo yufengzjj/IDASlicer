@@ -23,16 +23,15 @@ def values(start, end):
 
 @pytest.fixture
 def worker_runs(monkeypatch):
-    """Runs the worker for real, under this interpreter: inside IDA sys.prefix
-    holds python.exe, in a venv it sits under Scripts. Everything else -- the
-    scrubbed env, the pickle, the script -- is what perform_slice passed."""
+    """Runs the worker for real, exactly as perform_slice asked: the interpreter
+    it picked under this venv's sys.prefix, the scrubbed env, the pickle, the script."""
     calls = []
     real_run = subprocess.run
 
     def run(argv, **kw):
         calls.append((argv, kw))
         kw.pop("creationflags", None)
-        return real_run([sys.executable, *argv[1:]], **kw)
+        return real_run(argv, **kw)
 
     monkeypatch.setattr(idaslicer.subprocess, "run", run)
     return calls
@@ -50,7 +49,7 @@ def test_perform_slice(db, plugin, qt, worker_runs):
 
     assert qt.box.calls[-1][:2] == ("information", "Success"), qt.box.calls
     ((argv, kw),) = worker_runs
-    assert argv[0] == os.path.join(sys.prefix, "python.exe")
+    assert os.path.samefile(argv[0], sys.executable)
     assert not [k for k in kw["env"] if k != "IDADIR" and ("IDA" in k.upper() or k in ("PYTHONPATH", "PYTHONHOME"))]
     assert not os.path.exists(argv[1]) and not os.path.exists(argv[2]), "temp files left behind"
 
@@ -59,6 +58,7 @@ def test_perform_slice(db, plugin, qt, worker_runs):
     for e, got in zip(entries, out["ranges"]):
         seg = segs[(e.start, e.end)]
         assert (seg["perm"], seg["type"], seg["class"], seg["align"]) == (e.perm, e.seg_type, idaslicer.get_seg_class(e.seg_type), e.align), e.name
+        assert seg["bitness"] == ida_segment.getseg(e.start).bitness, e.name
         assert got == values(e.start, e.end), e.name
     bss = next(got for e, got in zip(entries, out["ranges"]) if e.seg_type == ida_segment.SEG_BSS)
     assert set(bss) == {None}
@@ -180,6 +180,27 @@ def test_worker_takes_the_source_compiler(tmp_path):
     assert res["cc_id"] == ida_typeinf.COMP_MS
     assert res["shown_names"]["??0bad_array_new_length@std@@QEAA@XZ"] == "std::bad_array_new_length::bad_array_new_length(void)"
     assert res["shown_names"]["_ZNSt20bad_array_new_lengthC2Ev"] == "std::bad_array_new_length::bad_array_new_length(void)"
+
+
+def test_worker_keeps_64bit_code_in_pe_x64(tmp_path):
+    """On x86, add_segm makes a 32-bit segment even in a 64-bit database."""
+    out = tmp_path / "slice.i64"
+    shutil.copy(os.path.join(os.path.dirname(TEMPLATE), "pe_x64.i64"), out)
+    entry = {
+        "name": "code",
+        "start": 0x140001000,
+        "end": 0x140001010,
+        "perm": 5,
+        "seg_type": ida_segment.SEG_CODE,
+        "align": ida_segment.saRelPara,
+        "bitness": 2,
+        "seg_class": "CODE",
+        "content": b"\x90" * 16,
+    }
+    r = _run_worker(tmp_path, out, [entry])
+    assert r.returncode == 0, r.stdout + r.stderr
+    seg = next(s for s in inspect(out)["segments"] if s["start"] == 0x140001000)
+    assert seg["bitness"] == 2
 
 
 def test_worker_hard_failure(tmp_path):

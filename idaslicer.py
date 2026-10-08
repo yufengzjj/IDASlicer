@@ -96,6 +96,8 @@ def run_worker(data_path):
                     # set_permissions() does not call it.
                     seg_obj = ida_segment.getseg(start)
                     if seg_obj is not None:
+                        if entry_data.get('bitness') is not None:
+                            ida_segment.set_segm_addressing(seg_obj, entry_data['bitness'])
                         if entry_data.get('seg_type') is not None:
                             seg_obj.type = entry_data['seg_type']
                         if entry_data.get('align') is not None:
@@ -219,6 +221,21 @@ def _export_entries(entries: list) -> list:
     return merged
 
 
+def _worker_python() -> str:
+    """The interpreter IDAPython runs on, which has `ida_domain` installed.
+    sys.executable is ida.exe inside IDA, so it is looked up under sys.prefix;
+    when IDA runs IDAPython in a venv, python.exe sits under Scripts there."""
+    if sys.platform == "win32":
+        candidates = ("python.exe", os.path.join("Scripts", "python.exe"))
+    else:
+        candidates = (os.path.join("bin", "python3"),)
+    for name in candidates:
+        path = os.path.join(sys.prefix, name)
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(f"No Python interpreter found under {sys.prefix}")
+
+
 class SlicerEntry:
     def __init__(self, name, start, end, perm, seg_type, align, sig="", recursive=False, ref=None):
         self.name = name
@@ -340,6 +357,20 @@ def get_seg_class(seg_type):
     elif seg_type == ida_segment.SEG_BSS:
         return "BSS"
     return "DATA"
+
+
+def _default_bitness() -> int:
+    """The open database's segment bitness code: 0, 1 or 2 for 16, 32 or 64 bits."""
+    if ida_ida.inf_is_64bit():
+        return 2
+    return 1 if ida_ida.inf_is_32bit_exactly() else 0
+
+
+def _seg_bitness(ea: int) -> int:
+    """Bitness code of the segment holding ea. A range must carry it: on x86,
+    add_segm makes a 32-bit segment even in a 64-bit database."""
+    s = ida_segment.getseg(ea)
+    return s.bitness if s is not None else _default_bitness()
 
 
 # Schema version for the pickled .seg payload (a plain dict). Bump when the
@@ -1601,22 +1632,24 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.type_edit = QtWidgets.QLineEdit()
         self.type_edit.setText(self.plugin.detect_file_type())
         type_layout.addWidget(self.type_edit)
-        self.layout.addLayout(type_layout)
-
         self.slice_button = QtWidgets.QPushButton("Slice and Create IDA Database")
         self.slice_button.clicked.connect(self.on_slice_clicked)
-        self.layout.addWidget(self.slice_button)
+        type_layout.addWidget(self.slice_button)
+        # A non-zero stretch factor takes all spare width, so the edit and button keep their natural size.
+        type_layout.addStretch(1)
+        self.layout.addLayout(type_layout)
 
-        self.merge_check = QtWidgets.QCheckBox("Merge all ranges into a single .seg file")
-        self.layout.addWidget(self.merge_check)
-
+        seg_layout = QtWidgets.QHBoxLayout()
         self.save_seg_button = QtWidgets.QPushButton("Save segments to .seg files")
         self.save_seg_button.clicked.connect(self.on_save_seg_clicked)
-        self.layout.addWidget(self.save_seg_button)
-
+        seg_layout.addWidget(self.save_seg_button)
+        self.merge_check = QtWidgets.QCheckBox("Merge all ranges into a single .seg file")
+        seg_layout.addWidget(self.merge_check)
         self.import_seg_button = QtWidgets.QPushButton("Import .seg files")
         self.import_seg_button.clicked.connect(self.on_import_seg_clicked)
-        self.layout.addWidget(self.import_seg_button)
+        seg_layout.addWidget(self.import_seg_button)
+        seg_layout.addStretch(1)
+        self.layout.addLayout(seg_layout)
 
     def on_settings_clicked(self):
         dialog = SettingsDialog(self.parent)
@@ -1859,17 +1892,19 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             self.form.table.refresh()
 
     @staticmethod
-    def _apply_seg_attrs(s, seg_type, align):
-        """Apply numeric segment type and alignment to a freshly created segment.
-        Takes the segment handle its caller just created rather than looking one
-        up by address, so it can never land on a neighbouring segment that
-        already existed. Either may be None when the payload did not record it.
+    def _apply_seg_attrs(s, seg_type, align, bitness):
+        """Apply bitness, numeric segment type and alignment to a freshly created
+        segment. Takes the segment handle its caller just created rather than
+        looking one up by address, so it can never land on a neighbouring segment
+        that already existed. Type and alignment may be None when the payload did
+        not record them; a missing bitness takes this database's default.
 
         Always ends with update(), even with nothing to apply: IDA's API asks for
         it after segment fields change, and ida_domain's set_permissions(), called
         just before, does not call it."""
         if not s:
             return
+        ida_segment.set_segm_addressing(s, _default_bitness() if bitness is None else bitness)
         if seg_type is not None:
             s.type = seg_type  # ty:ignore[invalid-assignment]
         if align is not None:
@@ -2076,6 +2111,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     "perm": entry.perm,
                     "seg_type": entry.seg_type,
                     "align": entry.align,
+                    "bitness": _seg_bitness(entry.start),
                     "seg_class": seg_class,
                     "names": self._collect_names(entry.start, entry.end),
                     "content": content,
@@ -2107,13 +2143,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     continue
                 if "IDA" in key.upper() or key in keys_to_remove:
                     env.pop(key, None)
-            if sys.platform == "win32":
-                python_exe = os.path.join(sys.prefix, "python.exe")
-            else:
-                python_exe = os.path.join(sys.prefix, "bin", "python3")
 
             result = subprocess.run(
-                [python_exe, script_path, data_path],
+                [_worker_python(), script_path, data_path],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -2177,6 +2209,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             "perm": entry.perm,
             "seg_type": entry.seg_type,
             "align": entry.align,
+            "bitness": _seg_bitness(entry.start),
             "seg_class": get_seg_class(entry.seg_type),
             "sig": hashlib.md5(content).hexdigest(),
             "names": IDASlicerPlugin._collect_names(entry.start, entry.end),
@@ -2307,6 +2340,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 perm = payload["perm"]
                 seg_type = payload.get("seg_type")
                 align = payload.get("align")
+                bitness = payload.get("bitness")
                 seg_class = payload["seg_class"]
                 content = payload.get("content") or b""
                 expected_sig = payload.get("sig")
@@ -2431,7 +2465,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                         new_seg = db.segments.add(0, current_pos, s.start_ea, unique_name, seg_class)
                         if new_seg:
                             db.segments.set_permissions(new_seg, perm)
-                            self._apply_seg_attrs(new_seg, seg_type, align)
+                            self._apply_seg_attrs(new_seg, seg_type, align, bitness)
                             wrote = write_values(current_pos, s.start_ea)
                             written.append((current_pos, s.start_ea))
                             results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(s.start_ea)}{'' if wrote else ' (no bytes)'}")
@@ -2443,7 +2477,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                     new_seg = db.segments.add(0, current_pos, end, unique_name, seg_class)
                     if new_seg:
                         db.segments.set_permissions(new_seg, perm)
-                        self._apply_seg_attrs(new_seg, seg_type, align)
+                        self._apply_seg_attrs(new_seg, seg_type, align, bitness)
                         wrote = write_values(current_pos, end)
                         written.append((current_pos, end))
                         results.append(f"Created segment '{unique_name}' at {hex(current_pos)}-{hex(end)}{'' if wrote else ' (no bytes)'}")

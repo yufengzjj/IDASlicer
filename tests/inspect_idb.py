@@ -52,6 +52,7 @@ def main(path, ranges):
                 "type": s.type,
                 "class": ida_segment.get_segm_class(s),
                 "align": s.align,
+                "bitness": s.bitness,
             }
         )
     for s, e in ranges:
