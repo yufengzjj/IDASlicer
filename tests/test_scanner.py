@@ -262,9 +262,7 @@ def test_caller_cluster_through_code_no_function_owns(db, leaf_undefined):
 
 def test_progress_in_wait_box(db, monkeypatch):
     shown = []
-    clock = itertools.count(1)
-    monkeypatch.setattr(idaslicer, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
-    monkeypatch.setattr(idaslicer, "_last_cancel_check", 0)
+    monkeypatch.setattr(idaslicer, "_UI_INTERVAL", 0)
     monkeypatch.setattr(idaslicer.ida_kernwin, "replace_wait_box", shown.append)
     idaslicer.collect_recursive_ranges_from_callers(db.ea("via_ptr"))
     assert shown[0].startswith("Finding callers...\n")

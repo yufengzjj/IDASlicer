@@ -27,14 +27,14 @@ def worker_runs(monkeypatch):
     """Runs the worker for real, exactly as perform_slice asked: the interpreter
     it picked under this venv's sys.prefix, the scrubbed env, the pickle, the script."""
     calls = []
-    real_run = subprocess.run
+    real_popen = subprocess.Popen
 
-    def run(argv, **kw):
+    def popen(argv, **kw):
         calls.append((argv, kw))
         kw.pop("creationflags", None)
-        return real_run(argv, **kw)
+        return real_popen(argv, **kw)
 
-    monkeypatch.setattr(idaslicer.subprocess, "run", run)
+    monkeypatch.setattr(idaslicer.subprocess, "Popen", popen)
     return calls
 
 
@@ -77,7 +77,7 @@ def test_perform_slice(db, plugin, qt, worker_runs):
     ],
 )
 def test_perform_slice_reports_worker_result(db, plugin, qt, monkeypatch, returncode, stdout, box):
-    monkeypatch.setattr(idaslicer.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, returncode, stdout, ""))
+    monkeypatch.setattr(idaslicer, "_run_worker", lambda argv, env: (returncode, stdout))
     leaf = db.ea("leaf")
     plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
     assert qt.box.calls[-1][:2] == box
@@ -96,18 +96,67 @@ def test_perform_slice_without_template(db, plugin, qt, worker_runs):
 def test_perform_slice_sends_the_compiler(db, plugin, qt, monkeypatch):
     sent = []
 
-    def run(argv, **kw):
+    def run(argv, env):
         with open(argv[2], "rb") as f:
             sent.append(pickle.load(f))
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return 0, ""
 
-    monkeypatch.setattr(idaslicer.subprocess, "run", run)
+    monkeypatch.setattr(idaslicer, "_run_worker", run)
     leaf = db.ea("leaf")
     plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
     ((_, cc_id, imagebase, source, _),) = sent
     assert cc_id == ida_ida.inf_get_cc_id()
     assert imagebase == ida_nalt.get_imagebase()
     assert source == [ida_nalt.get_root_filename(), ida_nalt.retrieve_input_file_md5().hex()]
+
+
+@pytest.fixture
+def wait_box(monkeypatch):
+    """Every update that reaches the wait box."""
+    shown = []
+    monkeypatch.setattr(idaslicer, "_UI_INTERVAL", 0)
+    monkeypatch.setattr(idaslicer.ida_kernwin, "replace_wait_box", shown.append)
+    return shown
+
+
+def test_perform_slice_shows_progress(db, plugin, qt, worker_runs, wait_box):
+    leaf = db.ea("leaf")
+    plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
+    assert qt.box.calls[-1][:2] == ("information", "Success"), qt.box.calls
+    assert "Reading ranges...\n0 of 1" in wait_box
+    assert "Creating the slice database...\nAdding segments: 0 of 1" in wait_box
+    assert wait_box[-1] == "Creating the slice database...\nSaving the database"
+
+
+@pytest.fixture
+def no_slice(db):
+    """The slice's output path, with what earlier tests wrote there removed."""
+    out = db.path.with_name("scan_arm64_slice.i64")
+    for p in out.parent.glob(out.stem + ".*"):
+        p.unlink()
+    return out
+
+
+def test_perform_slice_cancelled_while_reading(db, plugin, qt, monkeypatch, worker_runs, wait_box, no_slice):
+    monkeypatch.setattr(idaslicer.ida_kernwin, "user_cancelled", lambda: True)
+    leaf = db.ea("leaf")
+    plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
+    assert not worker_runs and not qt.box.calls
+    assert not no_slice.exists()
+
+
+def test_perform_slice_cancelled_in_the_worker(db, plugin, qt, monkeypatch, worker_runs, wait_box, no_slice):
+    out = no_slice
+    # Cancel once the worker has the database open, so it has files to leave behind.
+    monkeypatch.setattr(idaslicer.ida_kernwin, "user_cancelled", lambda: any("Adding segments" in s for s in wait_box))
+    leaf = db.ea("leaf")
+    plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
+    (argv, _), *killed = worker_runs
+    if sys.platform == "win32":
+        assert [a[0] for a, _ in killed] == ["taskkill"]
+    assert not qt.box.calls
+    assert not [p for p in out.parent.iterdir() if p.stem == out.stem], "slice files left behind"
+    assert not os.path.exists(argv[1]) and not os.path.exists(argv[2]), "temp files left behind"
 
 
 @pytest.mark.parametrize("template", sorted(f.removesuffix(".i64") for f in os.listdir(os.path.dirname(TEMPLATE)) if f.endswith(".i64")))

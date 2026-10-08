@@ -7,11 +7,13 @@ import itertools
 import json
 import os
 import pickle
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterable
 from typing import NamedTuple
@@ -50,7 +52,11 @@ WORKER_SCRIPT = """
 import sys
 import pickle
 import os
+import time
 import traceback
+
+def progress(text):
+    print("IDASLICER-PROGRESS: " + text, flush=True)
 
 def run_worker(data_path):
     try:
@@ -72,6 +78,7 @@ def run_worker(data_path):
         with open(data_path, 'rb') as f:
             out_path, cc_id, imagebase, source, entries_data = pickle.load(f)
 
+        progress("Opening the template database")
         with ida_domain.Database.open(out_path) as db:
             # IDA can drop the Root Node while opening (docs/worker-corrupt-i64);
             # saving then writes a database that cannot be opened again.
@@ -97,7 +104,11 @@ def run_worker(data_path):
                 node.supset(0, source[0])
                 node.supset(1, source[1])
             name_counts = {}
-            for entry_data in entries_data:
+            shown = 0.0
+            for i, entry_data in enumerate(entries_data):
+                if time.monotonic() - shown >= 0.2:
+                    shown = time.monotonic()
+                    progress(f"Adding segments: {i} of {len(entries_data)}")
                 name = entry_data['name']
                 if name in name_counts:
                     name_counts[name] += 1
@@ -139,6 +150,7 @@ def run_worker(data_path):
                     problems.append(f"{unique_name}: {type(e).__name__}: {e}")
 
             # Database is saved when db.__exit__ is called
+            progress("Saving the database")
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)
@@ -156,6 +168,7 @@ if __name__ == "__main__":
 """
 # Must match what WORKER_SCRIPT prints and exits with.
 WORKER_PROBLEM = "IDASLICER-PROBLEM: "
+WORKER_PROGRESS = "IDASLICER-PROGRESS: "
 WORKER_EXIT_PROBLEMS = 2
 # Must match the netnode WORKER_SCRIPT writes: a slice's source binary, file
 # name at supval 0 and input-file MD5 (hex, "" when unknown) at supval 1.
@@ -269,6 +282,73 @@ def _worker_python() -> str:
         if os.path.isfile(path):
             return path
     raise FileNotFoundError(f"No Python interpreter found under {sys.prefix}")
+
+
+def _run_worker(argv: list[str], env: dict) -> tuple[int | None, str]:
+    """Run the worker, showing the progress it reports in the wait box. Returns
+    its exit code and its output without the progress lines; the code is None
+    when the user cancelled, which kills the worker."""
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+    lines = queue.Queue()
+
+    def read():
+        for line in proc.stdout or ():
+            lines.put(line)
+        lines.put(None)
+
+    # The UI has to keep running while the worker works: a blocking read would freeze it.
+    threading.Thread(target=read, daemon=True).start()
+    output = []
+    status = "Starting the worker"
+    shown = 0.0
+    while True:
+        try:
+            line = lines.get(timeout=0.1)
+        except queue.Empty:
+            line = ""
+        if line is None:
+            break
+        if line.startswith(WORKER_PROGRESS):
+            status = line.removeprefix(WORKER_PROGRESS).strip()
+        elif line:
+            output.append(line)
+        if time.monotonic() - shown >= _UI_INTERVAL:
+            shown = time.monotonic()
+            ida_kernwin.replace_wait_box(f"Creating the slice database...\n{status}")
+            if ida_kernwin.user_cancelled():
+                _kill_tree(proc)
+                return None, "".join(output)
+    return proc.wait(), "".join(output)
+
+
+def _kill_tree(proc: subprocess.Popen):
+    """Kill the worker and what it started: on Windows a venv's python.exe is a
+    launcher that runs the real interpreter as its child."""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+    proc.kill()
+    proc.wait()
+
+
+def _remove_database(path: str, timeout: float = 5.0):
+    """Delete a database and the files IDA unpacks it into, which a killed IDA
+    leaves behind, waiting up to `timeout` seconds for it to let go of them."""
+    base = os.path.splitext(path)[0]
+    deadline = time.monotonic() + timeout
+    for p in (path, *(base + ext for ext in (".id0", ".id1", ".id2", ".nam", ".til"))):
+        while True:
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+            except PermissionError as e:
+                if time.monotonic() < deadline:
+                    time.sleep(0.1)
+                    continue
+                print(f"[IDASlicer] Could not delete {p}: {e}")
+            except OSError as e:
+                print(f"[IDASlicer] Could not delete {p}: {e}")
+            break
 
 
 class SlicerEntry:
@@ -627,6 +707,7 @@ class ScanCancelled(Exception):
         self.ranges = ranges or []
 
 
+_UI_INTERVAL = 0.1
 _last_cancel_check = 0.0
 _status = None
 
@@ -647,7 +728,7 @@ def _check_cancel():
     UI at most every 0.1 s, since this sits in the scanner's inner loops."""
     global _last_cancel_check
     now = time.monotonic()
-    if now - _last_cancel_check < 0.1:
+    if now - _last_cancel_check < _UI_INTERVAL:
         return
     _last_cancel_check = now
     if _status is not None:
@@ -3077,41 +3158,56 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         out_name = os.path.splitext(base_name)[0] + "_slice.i64"
         out_path = os.path.join(out_dir, out_name)
 
+        ida_kernwin.show_wait_box("Reading ranges...")
         try:
-            shutil.copy(template_path, out_path)
-            print(f"Copied template to {out_path}")
-        except Exception as e:
-            print(f"Failed to copy template: {e}")
-            QtWidgets.QMessageBox.critical(None, "Error", f"Failed to copy template:\n{e}")
+            report = self._slice(entries, template_path, out_path)
+        finally:
+            ida_kernwin.hide_wait_box()
+        if report is None:
+            print("[IDASlicer] Slice cancelled.")
             return
+        kind, title, text = report
+        print(f"[IDASlicer] {title}: {text}")
+        getattr(QtWidgets.QMessageBox, kind)(None, title, text)
 
-        # Prepare data for subprocess
+    def _slice(self, entries: list[SlicerEntry], template_path: str, out_path: str) -> tuple[str, str, str] | None:
+        """The work of `perform_slice`, under its wait box. Returns what to report
+        as (QMessageBox method, title, text), or None when the user cancelled."""
         entries_data = []
         problems = []
-        for entry in entries:
-            seg_class = get_seg_class(entry.seg_type)
-            content, inited = _read_range(entry.start, entry.size())
-            if content is None:
-                problems.append(f"{entry.name}: could not read the bytes of {hex(entry.start)}-{hex(entry.end)}")
-            entries_data.append(
-                {
-                    "name": entry.name,
-                    "start": entry.start,
-                    "end": entry.end,
-                    "perm": entry.perm,
-                    "seg_type": entry.seg_type,
-                    "align": entry.align,
-                    "bitness": _seg_bitness(entry.start),
-                    "seg_class": seg_class,
-                    "names": self._collect_names(entry.start, entry.end),
-                    "content": content,
-                    "inited": inited,
-                }
-            )
+        try:
+            with _progress(lambda: f"Reading ranges...\n{len(entries_data)} of {len(entries)}"):
+                for entry in entries:
+                    _check_cancel()
+                    content, inited = _read_range(entry.start, entry.size())
+                    if content is None:
+                        problems.append(f"{entry.name}: could not read the bytes of {hex(entry.start)}-{hex(entry.end)}")
+                    entries_data.append(
+                        {
+                            "name": entry.name,
+                            "start": entry.start,
+                            "end": entry.end,
+                            "perm": entry.perm,
+                            "seg_type": entry.seg_type,
+                            "align": entry.align,
+                            "bitness": _seg_bitness(entry.start),
+                            "seg_class": get_seg_class(entry.seg_type),
+                            "names": self._collect_names(entry.start, entry.end),
+                            "content": content,
+                            "inited": inited,
+                        }
+                    )
+        except ScanCancelled:
+            return None
+
+        try:
+            shutil.copy(template_path, out_path)
+        except OSError as e:
+            return "critical", "Error", f"Failed to copy template:\n{e}"
+        print(f"Copied template to {out_path}")
 
         data_fd, data_path = tempfile.mkstemp(suffix=".pickle")
         script_fd, script_path = tempfile.mkstemp(suffix=".py")
-
         try:
             with os.fdopen(data_fd, "wb") as f:
                 source = [name or "" for name in source_binary()]
@@ -3135,36 +3231,26 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 if "IDA" in key.upper() or key in keys_to_remove:
                     env.pop(key, None)
 
-            result = subprocess.run(
-                [_worker_python(), script_path, data_path],
-                capture_output=True,
-                text=True,
-                env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            if result.returncode in (0, WORKER_EXIT_PROBLEMS):
-                problems += [line.removeprefix(WORKER_PROBLEM) for line in result.stdout.splitlines() if line.startswith(WORKER_PROBLEM)]
-                if problems:
-                    detail = "\n".join(problems)
-                    print(f"Slice saved to {out_path}, but incomplete:\n{detail}")
-                    QtWidgets.QMessageBox.warning(
-                        None, "Slice incomplete", f"Saved to:\n{out_path}\n\nThese ranges are missing or incomplete:\n{detail}"
-                    )
-                else:
-                    print(f"Slicing complete. Saved to: {out_path}")
-                    QtWidgets.QMessageBox.information(None, "Success", f"File saved to:\n{out_path}")
-            else:
-                error_msg = result.stderr or result.stdout
-                print(f"Subprocess failed:\n{error_msg}")
-                QtWidgets.QMessageBox.critical(None, "Error", f"Subprocess failed:\n{error_msg}")
+            ida_kernwin.replace_wait_box("Creating the slice database...")
+            returncode, output = _run_worker([_worker_python(), script_path, data_path], env)
         except Exception as e:
-            print(f"Error during subprocess orchestration: {e}")
-            QtWidgets.QMessageBox.critical(None, "Error", f"Error during subprocess orchestration:\n{e}")
+            return "critical", "Error", f"Error during subprocess orchestration:\n{e}"
         finally:
             if os.path.exists(data_path):
                 os.remove(data_path)
             if os.path.exists(script_path):
                 os.remove(script_path)
+
+        if returncode is None:
+            _remove_database(out_path)
+            return None
+        if returncode not in (0, WORKER_EXIT_PROBLEMS):
+            return "critical", "Error", f"Subprocess failed:\n{output}"
+        problems += [line.removeprefix(WORKER_PROBLEM) for line in output.splitlines() if line.startswith(WORKER_PROBLEM)]
+        if problems:
+            detail = "\n".join(problems)
+            return "warning", "Slice incomplete", f"Saved to:\n{out_path}\n\nThese ranges are missing or incomplete:\n{detail}"
+        return "information", "Success", f"File saved to:\n{out_path}"
 
     @staticmethod
     def _collect_names(start, end):
