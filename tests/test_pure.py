@@ -151,6 +151,21 @@ def test_added_msg():
     assert idaslicer._added_msg(0, 0) == "Added 0 ranges to the slicer list."
 
 
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("0x1000", 0x1000),
+        (" 0XaBc ", 0xABC),
+        ("0x1000-0x2000", None),
+        ("1000", None),
+        ("sub_1000", None),
+        ("", None),
+    ],
+)
+def test_parse_addr_query(text, expected):
+    assert idaslicer._parse_addr_query(text) == expected
+
+
 def test_worker_markers_match_host():
     assert f'"{idaslicer.WORKER_PROBLEM}' in idaslicer.WORKER_SCRIPT
     assert f"sys.exit({idaslicer.WORKER_EXIT_PROBLEMS})" in idaslicer.WORKER_SCRIPT

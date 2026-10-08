@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pickle
+import re
 import shutil
 import subprocess
 import sys
@@ -322,6 +323,15 @@ def _ref_label(ea: int | None) -> str:
             return f"{hex(ea)} ({name}+{hex(off)})" if off else f"{hex(ea)} ({name})"
     name = ida_name.get_name(ea)
     return f"{hex(ea)} ({_demangled(name)})" if name else hex(ea)
+
+
+_ADDR_QUERY = re.compile(r"0x([0-9a-f]+)", re.IGNORECASE)
+
+
+def _parse_addr_query(text: str) -> int | None:
+    """The address a search string names, such as "0x1000", or None."""
+    m = _ADDR_QUERY.fullmatch(text.strip())
+    return int(m[1], 16) if m else None
 
 
 def get_seg_class(seg_type):
@@ -1291,11 +1301,15 @@ class SlicerTable(QtWidgets.QTableWidget):
             self.plugin.rescan_range_entry(entry)
 
     def apply_filter(self, text):
-        """Hide rows where no column contains `text` (case-insensitive)."""
+        """Hide rows where no column contains `text` (case-insensitive) and, when
+        `text` is an address, whose range does not contain it."""
         self._filter_text = text or ""
         needle = self._filter_text.lower()
+        addr = _parse_addr_query(needle)
         for row in range(self.rowCount()):
             hit = not needle
+            if not hit and addr is not None and row < len(self.entries):
+                hit = self.entries[row].start <= addr < self.entries[row].end
             if not hit:
                 for col in range(self.columnCount()):
                     item = self.item(row, col)
@@ -1569,7 +1583,7 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         search_layout = QtWidgets.QHBoxLayout()
         search_layout.addWidget(QtWidgets.QLabel("Search:"))
         self.search_edit = QtWidgets.QLineEdit()
-        self.search_edit.setPlaceholderText("Filter rows by any field...")
+        self.search_edit.setPlaceholderText("Filter by any field, or by an address (0x1000) inside a range...")
         self.search_edit.setClearButtonEnabled(True)
         search_layout.addWidget(self.search_edit)
         self.settings_button = QtWidgets.QPushButton("Settings")
