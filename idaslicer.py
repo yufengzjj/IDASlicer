@@ -459,6 +459,7 @@ DEFAULT_SETTINGS = {
     "skip_named_data": False,
     "autosave_minutes": 0,
     "autosave_keep": 10,
+    "export_all_types": False,
 }
 SETTINGS = dict(DEFAULT_SETTINGS)
 
@@ -475,9 +476,10 @@ def _apply_stored_settings(stored):
     val = stored.get("max_explore_len")
     if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
         SETTINGS["max_explore_len"] = val
-    val = stored.get("skip_named_data")
-    if isinstance(val, bool):
-        SETTINGS["skip_named_data"] = val
+    for key in ("skip_named_data", "export_all_types"):
+        val = stored.get(key)
+        if isinstance(val, bool):
+            SETTINGS[key] = val
     for key, low in (("autosave_minutes", 0), ("autosave_keep", 1)):
         val = stored.get(key)
         if isinstance(val, int) and not isinstance(val, bool) and val >= low:
@@ -1249,14 +1251,60 @@ def _loc_from_json(j: list, delta: int):
     return loc
 
 
-def _export_types() -> list[str]:
+def _export_types(names: set[str] | None = None) -> list[str]:
+    """Every local type, or only the named ones together with what they depend on."""
     til = ida_typeinf.get_idati()
-    ordinals = list(range(1, ida_typeinf.get_ordinal_limit(til)))
+    if names is None:
+        ordinals = list(range(1, ida_typeinf.get_ordinal_limit(til)))
+    else:
+        ordinals = sorted({o for o in (ida_typeinf.get_type_ordinal(til, n) for n in names) if o})
     if not ordinals:
         return []
     sink = _TextSink()  # ty:ignore[missing-argument]
     ida_typeinf.print_decls(sink, til, ordinals, ida_typeinf.PDF_INCL_DEPS | ida_typeinf.PDF_DEF_FWD)
     return "".join(sink.parts).splitlines()
+
+
+def _named_types(tif, out: set[str]):
+    """Add the named types `tif` refers to directly."""
+    name = tif.get_type_name()
+    if name:
+        out.add(name)
+    elif tif.is_ptr():
+        _named_types(tif.get_pointed_object(), out)
+    elif tif.is_array():
+        _named_types(tif.get_array_element(), out)
+    elif tif.is_func():
+        details = ida_typeinf.func_type_data_t()  # ty:ignore[missing-argument]
+        if tif.get_func_details(details):
+            _named_types(details.rettype, out)
+            for arg in details:
+                _named_types(arg.type, out)
+    elif tif.is_udt():
+        details = ida_typeinf.udt_type_data_t()  # ty:ignore[missing-argument]
+        if tif.get_udt_details(details):
+            for member in details:
+                _named_types(member.type, out)
+
+
+def _referenced_types(out: dict) -> set[str]:
+    """Names of the types the rest of an export_user_data() result refers to."""
+    names = set()
+    decls = [decl for _, decl in out["applied_types"]]
+    for func in out["decompiler"] or []:
+        decls += [v["type"] for v in func.get("lvars", {}).get("vars", []) if v["type"]]
+        decls += [decl for _, _, decl in func.get("calls", [])]
+        names.update(form[7] for form in func.get("numforms", []) if form[7])
+    for _, _, kind, *args in out["operands"]:
+        if kind == "enum":
+            names.add(args[0])
+        elif kind == "stroff":
+            names.update(args[0])
+    for decl in decls:
+        tif = _parse_type(decl)
+        if tif is not None:
+            _named_types(tif, names)
+    return names
 
 
 def _type_blocks(lines: list[str]) -> list[str]:
@@ -1409,11 +1457,15 @@ def _export_decompiler(func_starts: list[int], out: dict) -> list | None:
     return funcs
 
 
-def export_user_data() -> dict:
+def export_user_data(all_types: bool | None = None) -> dict:
     """What the user added to the analysis -- patched bytes, names, types,
     comments, operand representation, bookmarks and decompiler edits -- for
-    import_user_data() to apply to a fresh database of the same binary. Local
-    types go out whole: IDA does not record which of them the user wrote."""
+    import_user_data() to apply to a fresh database of the same binary. IDA does
+    not record which local types the user wrote, so only those the rest of the
+    export refers to go out, with what they depend on; `all_types` (default:
+    the export_all_types setting) exports every one."""
+    if all_types is None:
+        all_types = SETTINGS["export_all_types"]
     md5 = ida_nalt.retrieve_input_file_md5()
     out = {
         "format": USERDATA_FORMAT,
@@ -1422,7 +1474,7 @@ def export_user_data() -> dict:
         "input_md5": md5.hex() if md5 else None,
         "imagebase": ida_nalt.get_imagebase(),
         "not_exported": [],
-        "types": _export_types(),
+        "types": [],
         "patches": [],
         "functions": [],
         "names": [],
@@ -1439,6 +1491,7 @@ def export_user_data() -> dict:
     _export_heads(out)
     _export_bookmarks(out)
     out["decompiler"] = _export_decompiler([start for start, _ in out["functions"]], out)
+    out["types"] = _export_types(None if all_types else _referenced_types(out))
     return out
 
 
@@ -2159,8 +2212,18 @@ class SettingsDialog(QtWidgets.QDialog):
         self.keep_spin.setRange(1, 1000)
         self.keep_spin.setValue(SETTINGS["autosave_keep"])
         self.keep_spin.setToolTip("Older automatic exports are deleted. Exports made with the panel button are never deleted.")
+        self.all_types_check = QtWidgets.QCheckBox("Export every local type")
+        self.all_types_check.setChecked(SETTINGS["export_all_types"])
+        self.all_types_check.setToolTip(
+            "IDA does not record which local types you wrote. By default an export\n"
+            "holds only the types used by the exported function, data and call\n"
+            "types, decompiler variables and operands, plus the types they depend\n"
+            "on. Turn this on to keep types nothing uses yet, or library types you\n"
+            "edited that only IDA's own prototypes use."
+        )
         layout.addRow("Auto-export analysis every:", self.autosave_spin)
         layout.addRow("Automatic exports to keep:", self.keep_spin)
+        layout.addRow("", self.all_types_check)
 
         standard = QtWidgets.QDialogButtonBox.StandardButton
         buttons = QtWidgets.QDialogButtonBox(_qt_flags(standard.Ok, standard.Cancel, standard.RestoreDefaults))
@@ -2174,6 +2237,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.skip_named_check.setChecked(DEFAULT_SETTINGS["skip_named_data"])
         self.autosave_spin.setValue(DEFAULT_SETTINGS["autosave_minutes"])
         self.keep_spin.setValue(DEFAULT_SETTINGS["autosave_keep"])
+        self.all_types_check.setChecked(DEFAULT_SETTINGS["export_all_types"])
 
     def values(self):
         return {
@@ -2181,6 +2245,7 @@ class SettingsDialog(QtWidgets.QDialog):
             "skip_named_data": self.skip_named_check.isChecked(),
             "autosave_minutes": self.autosave_spin.value(),
             "autosave_keep": self.keep_spin.value(),
+            "export_all_types": self.all_types_check.isChecked(),
         }
 
 

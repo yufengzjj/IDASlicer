@@ -67,13 +67,18 @@ def edits(db):
     """One user edit of every kind the export covers."""
     assert ida_hexrays.init_hexrays_plugin(), "the tests need the arm64 decompiler"
     e = {name: db.ea(name) for name in ("root", "leaf", "walk", "via_ptr2", "g_n1", "g_msg")}
-    assert ida_typeinf.parse_decls(None, "struct Node { Node *next; int v; }; enum Mask { MASK_55 = 0x55 };", None, ida_typeinf.HTI_DCL) == 0
+    decls = (
+        "struct Node { Node *next; int v; }; enum Mask { MASK_55 = 0x55 }; struct Unused { int u; };"
+        "enum Kind { KIND_A }; struct Leaf { int x; }; struct Inner { Leaf leaf; Kind kind; }; struct Tail { int t; };"
+        "struct Payload { int a; Inner *in; Tail *tails[2]; }; typedef Payload *PayloadRef;"
+    )
+    assert ida_typeinf.parse_decls(None, decls, None, ida_typeinf.HTI_DCL) == 0
 
     e["original"] = ida_bytes.get_bytes(e["g_msg"], 5)
     ida_bytes.patch_bytes(e["g_msg"], b"HELLO")
     e["call"], e["udcall"] = _calls(e["root"])[:2]
     # What pressing Y on a call instruction does; it reports failure but sets the type.
-    idc.SetType(e["call"], "int __fastcall f(int x);")
+    idc.SetType(e["call"], "int __fastcall f(PayloadRef x);")
     assert ida_nalt.is_userti(e["call"])
 
     assert ida_name.set_name(e["leaf"], "my_leaf", ida_name.SN_NOCHECK)
@@ -147,12 +152,41 @@ def test_export_keeps_only_user_edits(edits):
     ops = {(ea, n): kind for ea, n, kind, *_ in data["operands"]}
     assert ops == {edits["stroff"]: "stroff", edits["enum"]: "enum", edits["forced"]: "forced"}
     assert data["bookmarks"] == [[3, edits["leaf"], "look here"]]
-    assert any(line.startswith("struct Node") for line in data["types"])
+    # Only the call type names PayloadRef; the rest of its chain comes from the types themselves.
+    chain = {"typedef Payload *PayloadRef;", "struct Payload", "struct Inner", "struct Tail", "struct Leaf", "enum Kind"}
+    assert {"struct Node", "enum Mask"} | chain <= _type_heads(data)
+    assert not any("Unused" in line or "short float" in line for line in data["types"])
     (root_hr,) = [f for f in data["decompiler"] if f["ea"] == edits["root"]]
     assert "count" in [v["name"] for v in root_hr["lvars"]["vars"]]
     assert {"comments", "labels", "numforms", "iflags", "unions"} <= root_hr.keys()
     assert [cea for cea, _, _ in root_hr["calls"]] == [edits["udcall"]]
     assert data["not_exported"] == []
+
+
+def _type_heads(data):
+    return {block.splitlines()[0] for block in idaslicer._type_blocks(data["types"])}
+
+
+def test_export_all_types(edits, monkeypatch):
+    every = idaslicer.export_user_data(all_types=True)
+    assert "struct Unused" in _type_heads(every)
+    assert any("short float" in line for line in every["types"])
+    monkeypatch.setitem(idaslicer.SETTINGS, "export_all_types", True)
+    assert idaslicer.export_user_data() == every
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="create_struct (Alt+Q) stores no type at the address, so no is_userti")
+def test_struct_var_on_data_is_exported(edits, db):
+    ea = db.ea("g_n2")
+    tid = ida_typeinf.get_named_type_tid("Node")
+    size = ida_typeinf.tinfo_t(tid=tid).get_size()
+    # A length of -1 ("the struct's size") fails on IDA 9.5.
+    if not ida_bytes.create_struct(ea, size, tid, True) or not ida_bytes.is_struct(ida_bytes.get_flags(ea)):
+        pytest.fail("create_struct did not make a struct item")
+    try:
+        assert ea in {a for a, _ in idaslicer.export_user_data()["applied_types"]}
+    finally:
+        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
 
 
 def _wipe(e):
@@ -180,18 +214,20 @@ def _wipe(e):
     ida_hexrays.mark_cfunc_dirty(e["root"])
 
 
-def test_import_restores_every_edit(edits):
-    before = idaslicer.export_user_data()
+@pytest.mark.parametrize("all_types", [False, True])
+def test_import_restores_every_edit(edits, all_types):
+    before = idaslicer.export_user_data(all_types)
     # IDA prints the decompiler's ARM SVE types with `short float`, which its own
     # parser rejects; re-parsing them would damage them.
-    assert any("short float" in line for line in before["types"])
+    assert any("short float" in line for line in before["types"]) == all_types
     _wipe(edits)
-    assert idaslicer.export_user_data() != before
+    assert idaslicer.export_user_data(all_types) != before
     done, problems = idaslicer.import_user_data(json.loads(idaslicer.format_user_data(before)))
     assert problems == []
     assert done["name"] == len(before["names"])
-    assert done["local type"] == 1
-    assert idaslicer.export_user_data() == before
+    # Node, and with only referenced types also the forward declarations they open with.
+    assert done["local type"] == (1 if all_types else 2)
+    assert idaslicer.export_user_data(all_types) == before
     assert "count" in _lvar_names(edits["root"])
 
 

@@ -131,12 +131,12 @@ def test_truncate_filename_name(name, suffix, limit):
     "stored, expected",
     [
         (
-            {"max_explore_len": 64, "skip_named_data": True, "autosave_minutes": 0, "autosave_keep": 3},
-            {"max_explore_len": 64, "skip_named_data": True, "autosave_minutes": 0, "autosave_keep": 3},
+            {"max_explore_len": 64, "skip_named_data": True, "autosave_minutes": 0, "autosave_keep": 3, "export_all_types": True},
+            {"max_explore_len": 64, "skip_named_data": True, "autosave_minutes": 0, "autosave_keep": 3, "export_all_types": True},
         ),
         ({"autosave_minutes": -1, "autosave_keep": 0}, idaslicer.DEFAULT_SETTINGS),
         ({"autosave_minutes": False, "autosave_keep": "5"}, idaslicer.DEFAULT_SETTINGS),
-        ({"max_explore_len": True, "skip_named_data": 1}, idaslicer.DEFAULT_SETTINGS),
+        ({"max_explore_len": True, "skip_named_data": 1, "export_all_types": "yes"}, idaslicer.DEFAULT_SETTINGS),
         ({"max_explore_len": -1}, idaslicer.DEFAULT_SETTINGS),
         ({"max_explore_len": "64"}, idaslicer.DEFAULT_SETTINGS),
         (["max_explore_len"], idaslicer.DEFAULT_SETTINGS),
