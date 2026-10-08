@@ -1,5 +1,8 @@
 import json
+import os
 
+import ida_loader
+import ida_nalt
 import ida_segment
 
 import idaslicer
@@ -83,12 +86,36 @@ def test_display_name_demangles_the_symbol(db):
     assert idaslicer._display_name("_ZNSt20bad_array_new_lengthC2Ev_0x2000", 0x1000) == "_ZNSt20bad_array_new_lengthC2Ev_0x2000"
 
 
-def test_config_round_trip_keeps_other_binaries(db, plugin, tmp_path):
-    path = tmp_path / "idaslicer_config.json"
-    path.write_text(json.dumps({"entries": {"other": [{"name": "x", "start": 1, "end": 2}]}}))
+def test_slicer_list_lives_next_to_the_database(db, plugin, tmp_path):
+    config, listed = tmp_path / "idaslicer_config.json", tmp_path / "db.slicer.json"
+    other = {"entries": {"other": [{"name": "x", "start": 1, "end": 2}]}}
+    config.write_text(json.dumps(other))
+    plugin.load_config()
+    assert plugin.entries == []
+    assert plugin.save_entries() and not listed.exists(), "no file for an empty list"
     plugin.entries = [_entry(db.ea("leaf"), db.ea("callee_a"), "mine")]
-    plugin.save_config()
+    assert plugin.save_entries()
     plugin.entries = []
     plugin.load_config()
     assert [(e.name, e.start, e.end) for e in plugin.entries] == [("mine", db.ea("leaf"), db.ea("callee_a"))]
-    assert json.loads(path.read_text())["entries"]["other"] == [{"name": "x", "start": 1, "end": 2}]
+    assert json.loads(config.read_text()) == other
+    plugin.save_settings()
+    saved = json.loads(config.read_text())
+    assert saved["entries"] == other["entries"] and saved["settings"] == idaslicer.SETTINGS
+    idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    assert os.path.normcase(idb) == os.path.normcase(f"{db.path}.i64")
+    assert os.path.normcase(idaslicer._slicer_list_path()) == os.path.normcase(f"{db.path}.slicer.json")
+
+
+def test_old_list_moves_out_of_the_config(db, plugin, tmp_path):
+    config, listed = tmp_path / "idaslicer_config.json", tmp_path / "db.slicer.json"
+    md5 = ida_nalt.retrieve_input_file_md5().hex()
+    old = _entry(db.ea("leaf"), db.ea("callee_a"), "old").to_dict()
+    config.write_text(json.dumps({"entries": {md5: [old], "other": []}, "last_import_path": "C:/seg"}))
+    plugin.load_config()
+    assert [e.name for e in plugin.entries] == ["old"]
+    assert json.loads(listed.read_text())["entries"] == [old]
+    assert json.loads(config.read_text()) == {"entries": {"other": []}, "last_import_path": "C:/seg"}
+    plugin.entries = []
+    plugin.load_config()
+    assert [e.name for e in plugin.entries] == ["old"]

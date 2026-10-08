@@ -28,6 +28,7 @@ import ida_loader
 import ida_moves
 import ida_nalt
 import ida_name
+import ida_netnode
 import ida_pro
 import ida_range
 import ida_segment
@@ -68,7 +69,7 @@ def run_worker(data_path):
     problems = []
     try:
         with open(data_path, 'rb') as f:
-            out_path, cc_id, imagebase, entries_data = pickle.load(f)
+            out_path, cc_id, imagebase, source, entries_data = pickle.load(f)
 
         with ida_domain.Database.open(out_path) as db:
             # IDA can drop the Root Node while opening (docs/worker-corrupt-i64);
@@ -89,6 +90,11 @@ def run_worker(data_path):
             # too; an analysis export moves addresses by the image-base difference.
             if imagebase is not None:
                 ida_nalt.set_imagebase(imagebase)
+            # The template's own input file says nothing about the slice.
+            if source is not None:
+                node = ida_netnode.netnode("$ idaslicer source", 0, True)
+                node.supset(0, source[0])
+                node.supset(1, source[1])
             name_counts = {}
             for entry_data in entries_data:
                 name = entry_data['name']
@@ -150,6 +156,20 @@ if __name__ == "__main__":
 # Must match what WORKER_SCRIPT prints and exits with.
 WORKER_PROBLEM = "IDASLICER-PROBLEM: "
 WORKER_EXIT_PROBLEMS = 2
+# Must match the netnode WORKER_SCRIPT writes: a slice's source binary, file
+# name at supval 0 and input-file MD5 (hex, "" when unknown) at supval 1.
+SOURCE_NODE = "$ idaslicer source"
+
+
+def source_binary() -> tuple[str, str | None]:
+    """Name and MD5 (hex) of the binary this database's analysis belongs to: the
+    one a slice was cut from, else the database's own input file."""
+    node = ida_netnode.netnode(SOURCE_NODE, 0, False)
+    if node.index() != ida_netnode.BADNODE:
+        return node.supstr(0) or "", node.supstr(1) or None
+    md5 = ida_nalt.retrieve_input_file_md5()
+    return ida_nalt.get_root_filename(), md5.hex() if md5 else None
+
 
 # --- Data Model ---
 
@@ -447,8 +467,8 @@ def _read_range(ea: int, size: int) -> tuple[bytes | None, list[tuple[int, int]]
     return (content if runs else b""), runs
 
 
-# Scanner tuning, edited via the panel's Settings button and persisted globally
-# (not under the md5-keyed entries) in idaslicer_config.json.
+# Scanner tuning and the analysis auto-export, edited via the panel's Settings
+# button and persisted globally in idaslicer_config.json.
 #
 # Module-level rather than plugin attributes because the scanner is a tree of
 # free functions that never receives the plugin instance -- threading these
@@ -1445,12 +1465,12 @@ def export_user_data(all_types: bool | None = None, ranges: list[tuple[int, int]
     their start."""
     if all_types is None:
         all_types = SETTINGS["export_all_types"]
-    md5 = ida_nalt.retrieve_input_file_md5()
+    input_file, input_md5 = source_binary()
     out = {
         "format": USERDATA_FORMAT,
         "version": USERDATA_VERSION,
-        "input_file": ida_nalt.get_root_filename(),
-        "input_md5": md5.hex() if md5 else None,
+        "input_file": input_file,
+        "input_md5": input_md5,
         "imagebase": ida_nalt.get_imagebase(),
         "not_exported": [],
         "types": [],
@@ -1559,14 +1579,45 @@ def shift_by_image_base(data: dict) -> bool | None:
     return None
 
 
-def import_user_data(data: dict, shift: bool = True) -> tuple[collections.Counter, list[str]]:
+def _within_ranges(data: dict, ranges: list[tuple[int, int]], delta: int) -> tuple[dict, int]:
+    """`data` without the items that land outside `ranges` once moved by
+    `delta`, patches cut to them, and how many items were left out. Local
+    types have no address and stay."""
+    where = {
+        "functions": lambda item: item[0],
+        "names": lambda item: item[0],
+        "applied_types": lambda item: item[0],
+        "func_comments": lambda item: item[0],
+        "bookmarks": lambda item: item[1],
+        "decompiler": lambda item: item["ea"],
+    }
+    out, skipped = dict(data), 0
+    for key, address in where.items():
+        if data.get(key) is None:
+            continue
+        out[key] = [item for item in data[key] if _in_ranges(address(item) + delta, ranges)]
+        skipped += len(data[key]) - len(out[key])
+    out["patches"] = []
+    for ea, original, patched in data.get("patches", []):
+        original, patched, start = bytes.fromhex(original), bytes.fromhex(patched), ea + delta
+        cut = [(max(s, start), min(e, start + len(original))) for s, e in ranges]
+        cut = [(lo - start, hi - start) for lo, hi in cut if lo < hi]
+        out["patches"] += [[ea + lo, original[lo:hi].hex(), patched[lo:hi].hex()] for lo, hi in cut]
+        skipped += not cut
+    return out, skipped
+
+
+def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int]] | None = None) -> tuple[collections.Counter, list[str]]:
     """Apply an export_user_data() result to the open database; what the file
     holds wins over what is there. With `shift`, addresses move by the change
-    in image base (see shift_by_image_base). Returns how many items of each
-    kind were applied, and what failed."""
+    in image base (see shift_by_image_base). `ranges` (sorted, disjoint, in
+    this database's addresses) limits it to what lands in them. Returns how
+    many items of each kind were applied, and what failed."""
     delta = ida_nalt.get_imagebase() - data["imagebase"] if shift else 0
     done = collections.Counter()
     problems = []
+    if ranges is not None:
+        data, done["outside the listed ranges, skipped"] = _within_ranges(data, ranges, delta)
 
     def check(ok, kind: str, what: str) -> bool:
         if ok:
@@ -1655,8 +1706,8 @@ def format_user_data(data: dict) -> str:
     return "{\n" + ",\n".join(parts) + "\n}\n"
 
 
-def write_user_data(path: str, text: str):
-    """Through a temporary file, so a crash while writing leaves the previous export intact."""
+def write_atomic(path: str, text: str):
+    """Through a temporary file, so a crash while writing leaves the previous file intact."""
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)
@@ -1684,7 +1735,7 @@ def save_rotating(folder: str, text: str, keep: int) -> str | None:
                 return None
     name = time.strftime("%Y%m%d-%H%M%S") + ".json"
     path = os.path.join(folder, name)
-    write_user_data(path, text)
+    write_atomic(path, text)
     for f in sorted({*old, name})[:-keep]:
         os.remove(os.path.join(folder, f))
     return path
@@ -1708,6 +1759,13 @@ def _userdata_counts(data: dict) -> str:
 
 def _autosave_dir() -> str:
     return os.path.splitext(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))[0] + ".userdata"
+
+
+def _slicer_list_path() -> str | None:
+    """Where this database's slicer list lives: next to the database, so each
+    slice keeps its own even though every slice from one template has the same input file."""
+    idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    return os.path.splitext(idb)[0] + ".slicer.json" if idb else None
 
 
 # Events that can change what export_user_data() writes, apart from decompiler
@@ -1843,7 +1901,7 @@ class SlicerTable(QtWidgets.QTableWidget):
     def add_entry(self, entry):
         self.entries.append(entry)
         self.refresh()
-        self.plugin.save_config()
+        self.plugin.save_entries()
 
     def refresh(self):
         # setItem emits itemChanged, so rebuilding the table would otherwise
@@ -1932,7 +1990,7 @@ class SlicerTable(QtWidgets.QTableWidget):
             return
 
         self.refresh()
-        self.plugin.save_config()
+        self.plugin.save_entries()
 
         # Same rule as the Edit dialog: a recursive entry whose range moved gets
         # its new range scanned for references.
@@ -2043,7 +2101,7 @@ class SlicerTable(QtWidgets.QTableWidget):
         for row in sorted(rows, reverse=True):
             self.entries.pop(row)
         self.refresh()
-        self.plugin.save_config()
+        self.plugin.save_entries()
 
     def keyPressEvent(self, event):
         if event.key() == QtCore.Qt.Key.Key_Delete:
@@ -2141,7 +2199,7 @@ class SlicerTable(QtWidgets.QTableWidget):
             entry.update_sig()
 
             self.refresh()
-            self.plugin.save_config()
+            self.plugin.save_entries()
 
             # If this is a recursive entry and its range changed, scan the new
             # range for references and add any newly discovered ranges.
@@ -2298,17 +2356,19 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.export_analysis_button.setToolTip("Save your names, types, function comments and decompiler edits to a file")
         self.export_analysis_button.clicked.connect(lambda: self.plugin.export_analysis(self.analysis_ranges_check.isChecked()))
         analysis_layout.addWidget(self.export_analysis_button)
-        self.analysis_ranges_check = QtWidgets.QCheckBox("Only the listed ranges")
-        self.analysis_ranges_check.setToolTip(
-            "Export only what lies in the ranges of the slicer list, e.g. to carry\n"
-            "this database's analysis into a slice made from them. Functions count\n"
-            "by their start. The automatic export always covers the whole database."
-        )
-        analysis_layout.addWidget(self.analysis_ranges_check)
         self.import_analysis_button = QtWidgets.QPushButton("Import user analysis...")
         self.import_analysis_button.setToolTip("Apply an exported analysis to this database, e.g. one rebuilt after a crash")
-        self.import_analysis_button.clicked.connect(self.plugin.import_analysis)
+        self.import_analysis_button.clicked.connect(lambda: self.plugin.import_analysis(self.analysis_ranges_check.isChecked()))
         analysis_layout.addWidget(self.import_analysis_button)
+        self.analysis_ranges_check = QtWidgets.QCheckBox("Only the listed ranges")
+        self.analysis_ranges_check.setToolTip(
+            "Export or import only what lies in the ranges of the slicer list:\n"
+            "carry this database's analysis into a slice made from them, or let an\n"
+            "import touch nothing outside them. Functions count by their start;\n"
+            "local types have no address and are imported whole. The automatic\n"
+            "export always covers the whole database."
+        )
+        analysis_layout.addWidget(self.analysis_ranges_check)
         analysis_layout.addStretch(1)
         self.layout.addLayout(analysis_layout)
 
@@ -2316,7 +2376,7 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         dialog = SettingsDialog(self.parent)
         if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
             SETTINGS.update(dialog.values())
-            self.plugin.save_config()
+            self.plugin.save_settings()
 
     def OnClose(self, form):
         # IDA destroys the Qt widgets when the form closes, but this Python
@@ -2439,59 +2499,72 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         return ida_idaapi.PLUGIN_KEEP
 
     def _get_config_path(self):
-        # Store in the same directory as the plugin
+        """Settings shared by every database, next to the plugin."""
         return os.path.join(os.path.dirname(os.path.realpath(__file__)), "idaslicer_config.json")
 
-    def load_config(self):
+    def _list_path(self) -> str | None:
+        return _slicer_list_path()
+
+    def _read_config(self) -> dict:
         path = self._get_config_path()
         if not os.path.exists(path):
-            return
-
+            return {}
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 config = json.load(f)
+        except (OSError, ValueError) as e:
+            print(f"[IDASlicer] Failed to read {path}: {e}")
+            return {}
+        return config if isinstance(config, dict) else {}
 
-            self.last_import_path = config.get("last_import_path", "")
-            _apply_stored_settings(config.get("settings"))
+    def _write_config(self, config: dict):
+        try:
+            write_atomic(self._get_config_path(), json.dumps(config, indent=4))
+        except OSError as e:
+            print(f"[IDASlicer] Failed to save the settings: {e}")
 
-            md5 = ida_nalt.retrieve_input_file_md5()
-            if md5:
-                md5_hex = md5.hex()
-                entries_data = config.get("entries", {}).get(md5_hex, [])
-                self.entries = [SlicerEntry.from_dict(d) for d in entries_data]
-
-            if self.form and hasattr(self.form, "table"):
-                self.form.table.refresh()
-        except Exception as e:
-            print(f"Failed to load IDASlicer config: {e}")
-
-    def save_config(self):
-        path = self._get_config_path()
-        config = {"entries": {}, "last_import_path": self.last_import_path, "settings": dict(SETTINGS)}
-
-        # Load existing config to preserve other MD5s
-        if os.path.exists(path):
+    def load_config(self):
+        config = self._read_config()
+        self.last_import_path = config.get("last_import_path", "")
+        _apply_stored_settings(config.get("settings"))
+        path = self._list_path()
+        if path and os.path.exists(path):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    config = json.load(f)
-            except:  # noqa: E722
-                pass
+                with open(path, encoding="utf-8") as f:
+                    self.entries = [SlicerEntry.from_dict(d) for d in json.load(f)["entries"]]
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                print(f"[IDASlicer] Failed to read the slicer list {path}: {e}")
+                self.entries = []
+        else:
+            # Slicer lists used to live in the global config, keyed by input-file MD5.
+            md5 = ida_nalt.retrieve_input_file_md5()
+            old = config.get("entries", {}).get(md5.hex()) if md5 else None
+            self.entries = [SlicerEntry.from_dict(d) for d in old or []]
+            if old is not None and self.save_entries():
+                del config["entries"][md5.hex()]
+                self._write_config(config)
+        if self.form and hasattr(self.form, "table"):
+            self.form.table.refresh()
 
+    def save_entries(self) -> bool:
+        """Write the slicer list next to the database. False when it could not be."""
+        path = self._list_path()
+        if not path:
+            return False
+        if not self.entries and not os.path.exists(path):
+            return True
+        try:
+            write_atomic(path, format_user_data({"entries": [e.to_dict() for e in self.entries]}))
+        except OSError as e:
+            print(f"[IDASlicer] Failed to save the slicer list {path}: {e}")
+            return False
+        return True
+
+    def save_settings(self):
+        config = self._read_config()
         config["last_import_path"] = self.last_import_path
         config["settings"] = dict(SETTINGS)
-
-        md5 = ida_nalt.retrieve_input_file_md5()
-        if md5:
-            md5_hex = md5.hex()
-            if "entries" not in config:
-                config["entries"] = {}
-            config["entries"][md5_hex] = [e.to_dict() for e in self.entries]  # ty:ignore[invalid-assignment]
-
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=4)
-        except Exception as e:
-            print(f"Failed to save IDASlicer config: {e}")
+        self._write_config(config)
 
     def term(self):
         self.unregister_actions()
@@ -2523,13 +2596,16 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         if path:
             print(f"[IDASlicer] Analysis auto-exported to {path}")
 
+    def _listed_ranges(self) -> list[tuple[int, int]] | None:
+        if not self.entries:
+            QtWidgets.QMessageBox.warning(None, "No ranges", "The slicer list is empty, so it has no ranges to limit this to.")
+            return None
+        return _merge_intervals((e.start, e.end) for e in self.entries)
+
     def export_analysis(self, listed_ranges: bool = False):
         ranges = None
-        if listed_ranges:
-            if not self.entries:
-                QtWidgets.QMessageBox.warning(None, "Nothing to export", "The slicer list is empty, so it has no ranges to export.")
-                return
-            ranges = _merge_intervals((e.start, e.end) for e in self.entries)
+        if listed_ranges and (ranges := self._listed_ranges()) is None:
+            return
         default = os.path.splitext(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))[0] + ".userdata.json"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(None, "Export user analysis", default, "Analysis export (*.json)")
         if not path:
@@ -2537,7 +2613,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         ida_kernwin.show_wait_box("Exporting user analysis...")
         try:
             data = export_user_data(ranges=ranges)
-            write_user_data(path, format_user_data(data))
+            write_atomic(path, format_user_data(data))
         except Exception as e:  # noqa: BLE001
             print(f"[IDASlicer] Analysis export failed: {e}")
             QtWidgets.QMessageBox.critical(None, "Export failed", str(e))
@@ -2552,7 +2628,10 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         print(f"[IDASlicer] {summary}")
         QtWidgets.QMessageBox.information(None, "Analysis exported", summary)
 
-    def import_analysis(self):
+    def import_analysis(self, listed_ranges: bool = False):
+        ranges = None
+        if listed_ranges and (ranges := self._listed_ranges()) is None:
+            return
         start_dir = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
         path, _ = QtWidgets.QFileDialog.getOpenFileName(None, "Import user analysis", start_dir, "Analysis export (*.json);;All files (*)")
         if not path:
@@ -2562,13 +2641,14 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         except (OSError, ValueError) as e:
             QtWidgets.QMessageBox.critical(None, "Import failed", str(e))
             return
-        md5 = ida_nalt.retrieve_input_file_md5()
-        if data.get("input_md5") and md5 and data["input_md5"] != md5.hex():
+        source_file, source_md5 = source_binary()
+        if data.get("input_md5") and source_md5 and data["input_md5"] != source_md5:
             answer = QtWidgets.QMessageBox.question(
                 None,
                 "Different binary",
                 f"{os.path.basename(path)} was exported from {data.get('input_file')}, not from this binary "
-                f"({ida_nalt.get_root_filename()}). That is expected for a slice of it. Import it anyway?",
+                f"({source_file}) or a slice of it. Import it anyway?\n\n"
+                "A slice made by an older IDASlicer names its template's binary instead.",
             )
             if answer != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
@@ -2595,12 +2675,14 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             shift = answer == QtWidgets.QMessageBox.StandardButton.Yes
         ida_kernwin.show_wait_box("Importing user analysis...")
         try:
-            done, problems = import_user_data(data, shift)
+            done, problems = import_user_data(data, shift, ranges)
         finally:
             ida_kernwin.hide_wait_box()
         lines = [f"Applied from {path}:"]
         if delta:
             lines.append(f"  addresses moved by {delta:#x} for the new image base" if shift else "  addresses kept, image base ignored")
+        if ranges is not None:
+            lines.append(f"  only within {len(ranges)} ranges of the slicer list")
         lines += [f"  {kind}: {n}" for kind, n in sorted(done.items())]
         print("[IDASlicer] " + "\n".join(lines + problems))
         if problems:
@@ -2664,7 +2746,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         merged = before + len(entries) - len(self.entries)
         if merged:
             print(f"[IDASlicer] Merged {merged} overlapping range(s) into the entries they overlap.")
-        self.save_config()
+        self.save_entries()
         if self.form:
             self.form.table.refresh()
 
@@ -2779,7 +2861,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             return None
 
         added, extended = self._add_collected_ranges(ranges, origins, recursive)
-        self.save_config()
+        self.save_entries()
         if self.form:
             self.form.table.refresh()
 
@@ -2901,7 +2983,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
         try:
             with os.fdopen(data_fd, "wb") as f:
-                pickle.dump((out_path, ida_ida.inf_get_cc_id(), ida_nalt.get_imagebase(), entries_data), f)
+                source = [name or "" for name in source_binary()]
+                pickle.dump((out_path, ida_ida.inf_get_cc_id(), ida_nalt.get_imagebase(), source, entries_data), f)
 
             with os.fdopen(script_fd, "w") as f:
                 f.write(WORKER_SCRIPT)
@@ -3070,7 +3153,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             return
 
         self.last_import_path = os.path.dirname(files[0])
-        self.save_config()
+        self.save_settings()
 
         results = []
         imported_entries = []
@@ -3349,7 +3432,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             # An imported entry that is not a row of its own was folded into one:
             # either it stretched an existing entry or it was already covered.
             absorbed = sum(1 for e in imported_entries if id(e) not in survivors)
-            self.save_config()
+            self.save_entries()
             if self.form:
                 self.form.table.refresh()
 

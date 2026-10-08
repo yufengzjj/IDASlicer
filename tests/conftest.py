@@ -245,8 +245,9 @@ def qt():
 @pytest.fixture
 def plugin(tmp_path, monkeypatch, qt):
     """A plugin instance without init(): no actions, no UI hooks, and a config
-    file in tmp_path -- the real one next to the plugin is user data."""
+    file and slicer list in tmp_path -- the real config next to the plugin is user data."""
     monkeypatch.setattr(idaslicer.IDASlicerPlugin, "_get_config_path", lambda self: str(tmp_path / "idaslicer_config.json"))
+    monkeypatch.setattr(idaslicer.IDASlicerPlugin, "_list_path", lambda self: str(tmp_path / "db.slicer.json"))
     p = idaslicer.IDASlicerPlugin()
     p.form = None
     p.entries = []

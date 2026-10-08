@@ -149,6 +149,15 @@ def test_apply_stored_settings(monkeypatch, stored, expected):
     assert idaslicer.SETTINGS == expected
 
 
+def test_within_ranges_cuts_patches():
+    data = {"patches": [[0x10, "00" * 16, "ff" * 16], [0x40, "00", "ff"]], "names": [[0x11, "a", False], [0x30, "b", False]]}
+    # Ranges are in the target's addresses, 0x100 above the file's.
+    out, skipped = idaslicer._within_ranges(data, [(0x112, 0x114), (0x11E, 0x130)], 0x100)
+    assert out["patches"] == [[0x12, "0000", "ffff"], [0x1E, "0000", "ffff"]]
+    assert out["names"] == []
+    assert skipped == 3
+
+
 def test_added_msg():
     assert idaslicer._added_msg(2, 0) == "Added 2 ranges to the slicer list."
     assert idaslicer._added_msg(0, 3) == "Extended 3 existing ranges."
@@ -174,3 +183,4 @@ def test_parse_addr_query(text, expected):
 def test_worker_markers_match_host():
     assert f'"{idaslicer.WORKER_PROBLEM}' in idaslicer.WORKER_SCRIPT
     assert f"sys.exit({idaslicer.WORKER_EXIT_PROBLEMS})" in idaslicer.WORKER_SCRIPT
+    assert f'netnode("{idaslicer.SOURCE_NODE}", 0, True)' in idaslicer.WORKER_SCRIPT

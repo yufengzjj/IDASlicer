@@ -159,7 +159,7 @@ def test_export_limited_to_ranges(edits):
 
 def test_panel_exports_the_listed_ranges(edits, plugin, qt, tmp_path):
     plugin.export_analysis(True)
-    assert [c[:2] for c in qt.box.calls] == [("warning", "Nothing to export")]
+    assert [c[:2] for c in qt.box.calls] == [("warning", "No ranges")]
     origins = {}
     plugin._add_collected_ranges(idaslicer.collect_function_ranges(edits["leaf"], origins), origins, recursive=False)
     path = tmp_path / "ranges.json"
@@ -170,20 +170,6 @@ def test_panel_exports_the_listed_ranges(edits, plugin, qt, tmp_path):
     assert f"Only what lies in {count} ranges of the slicer list -- not a full backup" in qt.box.calls[-1][2]
     data = idaslicer.load_user_data(str(path))
     assert [start for start, _ in data["functions"]] == [edits["leaf"]]
-
-
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="create_struct (Alt+Q) stores no type at the address, so no is_userti")
-def test_struct_var_on_data_is_exported(edits, db):
-    ea = db.ea("g_n2")
-    tid = ida_typeinf.get_named_type_tid("Node")
-    size = ida_typeinf.tinfo_t(tid=tid).get_size()
-    # A length of -1 ("the struct's size") fails on IDA 9.5.
-    if not ida_bytes.create_struct(ea, size, tid, True) or not ida_bytes.is_struct(ida_bytes.get_flags(ea)):
-        pytest.fail("create_struct did not make a struct item")
-    try:
-        assert ea in {a for a, _ in idaslicer.export_user_data()["applied_types"]}
-    finally:
-        ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
 
 
 def _wipe(e):
@@ -219,6 +205,26 @@ def test_import_restores_every_edit(edits, all_types):
     assert done["local type"] == (1 if all_types else 2)
     assert idaslicer.export_user_data(all_types) == before
     assert "count" in _lvar_names(edits["root"])
+
+
+def test_import_limited_to_ranges(edits):
+    before = idaslicer.export_user_data()
+    _wipe(edits)
+    leaf = ida_funcs.get_func(edits["leaf"])
+    # The patch is cut: only "HE" of "HELLO" lies inside.
+    ranges = idaslicer._merge_intervals([(leaf.start_ea, leaf.end_ea), (edits["g_msg"], edits["g_msg"] + 2)])
+    done, problems = idaslicer.import_user_data(before, ranges=ranges)
+    assert problems == []
+    assert done["outside the listed ranges, skipped"] > 0
+    assert ida_name.get_ea_name(edits["leaf"], 0) == "my_leaf"
+    assert ida_funcs.get_func_cmt(leaf, True) == "leaf comment"
+    assert idc.get_bookmark(3) == edits["leaf"]
+    assert ida_bytes.get_bytes(edits["g_msg"], 5) == b"HE" + edits["original"][2:]
+    assert not ida_nalt.is_userti(edits["walk"])
+    assert "count" not in _lvar_names(edits["root"])
+    _, problems = idaslicer.import_user_data(before)
+    assert problems == []
+    assert idaslicer.export_user_data() == before
 
 
 def _json(data):
@@ -271,9 +277,17 @@ def test_edits_made_in_a_slice_go_back_to_the_source(edits, db, plugin, qt, tmp_
     script = tmp_path / "edits.py"
     script.write_text(_SLICE_EDITS.format(funcs=funcs, callee=callee, via=via, fill=fill), encoding="utf-8")
     from_slice = userdata_child.run(sliced, tmp_path / "out.json", script=script)["export"]
+    # The slice names its source, not the template's binary.
+    assert (from_slice["input_file"], from_slice["input_md5"]) == idaslicer.source_binary()
 
-    _, problems = idaslicer.import_user_data(from_slice)
-    assert problems == []
+    exported = tmp_path / "from_slice.json"
+    exported.write_text(idaslicer.format_user_data(from_slice), encoding="utf-8")
+    qt.files.files = [str(exported)]
+    qt.box.calls.clear()
+    ida_auto.auto_wait()
+    plugin.import_analysis()
+    assert [c[:2] for c in qt.box.calls] == [("information", "Analysis imported")], "no question about another binary"
+    assert "could not be applied" not in qt.box.calls[-1][2]
     assert ida_name.get_ea_name(callee, 0) == "slice_callee"
     assert ida_funcs.get_func_cmt(ida_funcs.get_func(callee), False) == "from the slice"
     assert "SliceS" in idaslicer._applied_type(via)
