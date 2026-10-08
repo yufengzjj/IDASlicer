@@ -32,6 +32,11 @@ def test_recursive_follows_fall_through(stripped_db, split_leaf):
     assert origins[start + 4] == start
 
 
+def test_caller_cluster_follows_fall_through(stripped_db, split_leaf):
+    start, _ = split_leaf
+    assert idaslicer.get_caller_cluster(start + 4) == [start + 4, start, stripped_db.ea("split_entry")]
+
+
 def test_scan_invariants_for_every_function(stripped_db):
     for ea in idautils.Functions():
         for collect in (idaslicer.collect_recursive_ranges, idaslicer.collect_function_ranges):

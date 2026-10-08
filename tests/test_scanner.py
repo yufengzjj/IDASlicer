@@ -208,6 +208,29 @@ def test_cancel_keeps_partial_result(db, monkeypatch):
     assert set(partial) <= set(full)
 
 
+@pytest.mark.parametrize(
+    "start, expected",
+    [
+        ("leaf", ["leaf", "callee_a", "fill_bss", "root", "_start", "split_entry"]),
+        # Through g_table, which only data points at via_ptr from.
+        ("via_ptr", ["via_ptr", "dispatch", "root", "_start", "split_entry"]),
+        ("g_counter", ["leaf", "callee_a", "fill_bss", "root", "_start", "split_entry"]),
+        ("uncalled", ["uncalled"]),
+    ],
+)
+def test_caller_cluster(db, start, expected):
+    assert [db.label(ea) for ea in idaslicer.get_caller_cluster(db.ea(start))] == expected
+
+
+def test_recursive_from_callers(db):
+    got = db.covered(idaslicer.collect_recursive_ranges_from_callers(db.ea("via_ptr")), SYMBOLS)
+    assert got == set(SYMBOLS) - {"uncalled", "g_unused"}
+
+
+def test_caller_cluster_through_code_no_function_owns(db, leaf_undefined):
+    assert [db.label(ea) for ea in idaslicer.get_caller_cluster(leaf_undefined)][:3] == ["leaf", "callee_a", "fill_bss"]
+
+
 @pytest.fixture
 def leaf_undefined(db):
     """`leaf` with its function deleted, as IDA leaves obfuscated code."""

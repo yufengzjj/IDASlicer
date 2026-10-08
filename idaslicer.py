@@ -781,6 +781,12 @@ def check_orphan_jumps(
                 check_func_range(ranges, ref.to, cur_func, funcs_to_export, processed_ranges, origins, head)
 
 
+def _is_call(ea) -> bool:
+    # A call followed by another function's start is a noreturn call IDA took
+    # for one that returns, not a split function.
+    return any(x.type in (ida_xref.fl_CN, ida_xref.fl_CF) for x in idautils.XrefsFrom(ea, ida_xref.XREF_FAR))
+
+
 def check_fall_through(
     ranges,
     cur_range: tuple[int, int],
@@ -802,10 +808,7 @@ def check_fall_through(
     if func is None:
         check_func_range(ranges, end, cur_func, funcs_to_export, processed_ranges, origins, last)
         return
-    # A call followed by another function's start is a noreturn call IDA took
-    # for one that returns, not a split function.
-    after_call = any(x.type in (ida_xref.fl_CN, ida_xref.fl_CF) for x in idautils.XrefsFrom(last, ida_xref.XREF_FAR))
-    if func.start_ea == end != cur_func.start_ea and not after_call and not processed_ranges.covers(end, func.end_ea):
+    if func.start_ea == end != cur_func.start_ea and not _is_call(last) and not processed_ranges.covers(end, func.end_ea):
         _record_origin(origins, end, last)
         ranges.append(ida_range.range_t(end, func.end_ea))
 
@@ -1014,6 +1017,52 @@ def get_recursive_functions(start_ea, origins: dict, ref_from: int | None = None
     return to_export
 
 
+def _referenced_addrs(start: int, end: int):
+    """Addresses in [start, end) that something refers to."""
+    ea = start if ida_bytes.has_xref(ida_bytes.get_flags(start)) else ida_bytes.next_that(start, end, ida_bytes.has_xref)
+    while ea != idaapi.BADADDR and ea < end:
+        yield ea
+        ea = ida_bytes.next_that(ea, end, ida_bytes.has_xref)
+
+
+def get_caller_cluster(ea) -> list[int]:
+    """The code of IDA's "Xrefs graph to" at `ea`: the function there and every
+    function that refers to it, followed up transitively, as start addresses
+    (BFS order, `ea`'s own first). A reference to any address in a function
+    counts, and so does falling through into its start. Data on the way -- a
+    function pointer table, a vtable -- is passed through: whatever refers to a
+    data item refers to the code it points at. Code no function owns is a node
+    too, extended by `reconstruct_func_range`."""
+    cluster = []
+    seen = set()
+    work = collections.deque([ea])
+    while work:
+        _check_cancel()
+        ref = work.popleft()
+        flags = ida_bytes.get_flags(ref)
+        func = ida_funcs.get_func(ref)
+        node = func.start_ea if func else ida_bytes.get_item_head(ref)
+        if node in seen:
+            continue
+        seen.add(node)
+
+        if func:
+            cluster.append(node)
+            targets = [h for h in idautils.FuncItems(node) if ida_bytes.has_xref(ida_bytes.get_flags(h))]
+            if ida_bytes.is_flow(ida_bytes.get_flags(node)):
+                prev = ida_bytes.prev_head(node, 0)
+                if prev != idaapi.BADADDR and not _is_call(prev):
+                    work.append(prev)
+        elif ida_bytes.is_code(flags):
+            cluster.append(node)
+            targets = [a for s, e in reconstruct_func_range(node) for a in _referenced_addrs(s, e)]
+        else:
+            targets = _referenced_addrs(node, node + max(ida_bytes.get_item_size(node), 1))
+        for target in targets:
+            work.extend(x.frm for x in idautils.XrefsTo(target, ida_xref.XREF_FAR))
+    return cluster
+
+
 class _NoFunc:
     """Sentinel passed as `cur_func` when scanning a range that is not inside a
     function. Its `start_ea` (BADADDR, or an address no function contains) never
@@ -1185,6 +1234,21 @@ def collect_recursive_ranges_from_ranges(seed_ranges, origins: dict | None = Non
     with _keep_partial(collected):
         _scan_worklist(seeds, _NO_FUNC, collected, queue, processed_ranges, origins)
         _drain_functions(queue, collected, processed_ranges, origins)
+    return collected
+
+
+def collect_recursive_ranges_from_callers(ea, origins: dict | None = None) -> list:
+    """Like `collect_recursive_ranges`, but seeded from every function in
+    `get_caller_cluster(ea)`: the code at `ea`, what refers to it, transitively,
+    and everything all of those reference."""
+    if origins is None:
+        origins = {}
+    queue = _FuncQueue()
+    collected = []
+    with _keep_partial(collected):
+        for start in get_caller_cluster(ea):
+            queue.add_closure(start, origins)
+        _drain_functions(queue, collected, _Coverage(), origins)
     return collected
 
 
@@ -2435,6 +2499,9 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
                     return 0
                 self.plugin.add_ranges_recursive(blocks)
             return 1
+        if self.mode == "callers_recursive":
+            self.plugin.add_callers_recursive(ctx.cur_ea)
+            return 1
         if self.mode == "function":
             return 1 if self.plugin.add_function(ctx.cur_ea) else 0
         elif self.mode == "segment":
@@ -2717,6 +2784,13 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         )
         ida_kernwin.register_action(
             ida_kernwin.action_desc_t(
+                "idaslicer:add_callers_recursive",
+                "Add callers (Xrefs graph to) recursively to slicer",
+                AddToSlicerHandler(self, "callers_recursive"),  # ty:ignore[too-many-positional-arguments]
+            )
+        )
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
                 "idaslicer:add_sel",
                 "Add selection to slicer",
                 AddToSlicerHandler(self, "selection"),  # ty:ignore[too-many-positional-arguments]
@@ -2733,6 +2807,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
     def unregister_actions(self):
         ida_kernwin.unregister_action("idaslicer:add_func")
         ida_kernwin.unregister_action("idaslicer:add_func_recursive")
+        ida_kernwin.unregister_action("idaslicer:add_callers_recursive")
         ida_kernwin.unregister_action("idaslicer:add_sel")
         ida_kernwin.unregister_action("idaslicer:add_seg")
 
@@ -2888,6 +2963,15 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         (recursively) to the slicer list."""
         result = self._scan_and_add(
             "Scanning recursive references...", f"Recursive scan of {hex(start_ea)}", lambda o: collect_recursive_ranges(start_ea, o)
+        )
+        if result and not result.cancelled:
+            ida_kernwin.info(_added_msg(result.added, result.extended))
+
+    def add_callers_recursive(self, ea: int):
+        """Like `add_function_recursive`, but seeded from the code at `ea` and
+        every function that refers to it, transitively (`get_caller_cluster`)."""
+        result = self._scan_and_add(
+            "Scanning callers and their references...", f"Callers scan of {hex(ea)}", lambda o: collect_recursive_ranges_from_callers(ea, o)
         )
         if result and not result.cancelled:
             ida_kernwin.info(_added_msg(result.added, result.extended))
@@ -3465,6 +3549,7 @@ class SlicerUIHooks(ida_kernwin.UI_Hooks):
         if ida_kernwin.get_widget_type(widget) == ida_kernwin.BWN_DISASM:
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_func", "Add to Slicer/")
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_func_recursive", "Add to Slicer/")
+            ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_callers_recursive", "Add to Slicer/")
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_sel", "Add to Slicer/")
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_seg", "Add to Slicer/")
 
