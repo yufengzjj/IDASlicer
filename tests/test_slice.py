@@ -104,10 +104,11 @@ def test_perform_slice_sends_the_compiler(db, plugin, qt, monkeypatch):
     monkeypatch.setattr(idaslicer, "_run_worker", run)
     leaf = db.ea("leaf")
     plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
-    ((_, cc_id, imagebase, source, _),) = sent
+    ((_, cc_id, imagebase, source, _, analysis),) = sent
     assert cc_id == ida_ida.inf_get_cc_id()
     assert imagebase == ida_nalt.get_imagebase()
     assert source == [ida_nalt.get_root_filename(), ida_nalt.retrieve_input_file_md5().hex()]
+    assert analysis is None
 
 
 @pytest.fixture
@@ -177,7 +178,7 @@ def test_template_matches_its_name(template, tmp_path):
 
 def _run_worker(tmp_path, out, entries_data, cc_id=None, imagebase=None):
     data = tmp_path / "data.pickle"
-    data.write_bytes(pickle.dumps((str(out), cc_id, imagebase, None, entries_data)))
+    data.write_bytes(pickle.dumps((str(out), cc_id, imagebase, None, entries_data, None)))
     script = tmp_path / "worker.py"
     script.write_text(idaslicer.WORKER_SCRIPT)
     return subprocess.run([sys.executable, str(script), str(data)], capture_output=True, text=True, timeout=300, check=False)

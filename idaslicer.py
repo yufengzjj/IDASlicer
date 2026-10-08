@@ -50,13 +50,41 @@ except ImportError:
 
 WORKER_SCRIPT = """
 import sys
+import json
 import pickle
 import os
 import time
 import traceback
+import types
 
 def progress(text):
     print("IDASLICER-PROGRESS: " + text, flush=True)
+
+def import_analysis(plugin_dir, data):
+    # idalib's PySide6 refuses to import outside the GUI, and the plugin needs
+    # Qt only to define its panel classes: any name will do as an empty class.
+    classes = {}
+
+    def lookup(name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return classes.setdefault(name, type(name, (), {}))
+
+    qt = types.ModuleType("PySide6")
+    for sub in ("QtCore", "QtWidgets"):
+        module = types.ModuleType("PySide6." + sub)
+        module.__getattr__ = lookup
+        setattr(qt, sub, module)
+        sys.modules[module.__name__] = module
+    sys.modules["PySide6"] = qt
+    sys.path.insert(0, plugin_dir)
+    import ida_auto
+    import idaslicer
+
+    done, problems = idaslicer.import_user_data(data)
+    progress("Analysing the slice")
+    ida_auto.auto_wait()
+    return {"done": dict(done), "problems": problems}
 
 def run_worker(data_path):
     try:
@@ -76,7 +104,7 @@ def run_worker(data_path):
     problems = []
     try:
         with open(data_path, 'rb') as f:
-            out_path, cc_id, imagebase, source, entries_data = pickle.load(f)
+            out_path, cc_id, imagebase, source, entries_data, analysis = pickle.load(f)
 
         progress("Opening the template database")
         with ida_domain.Database.open(out_path) as db:
@@ -149,6 +177,15 @@ def run_worker(data_path):
                 except Exception as e:
                     problems.append(f"{unique_name}: {type(e).__name__}: {e}")
 
+            if analysis is not None:
+                progress("Importing the analysis")
+                try:
+                    report = import_analysis(*analysis)
+                except Exception as e:
+                    traceback.print_exc()
+                    report = {"done": {}, "problems": [f"{type(e).__name__}: {e}"]}
+                print("IDASLICER-ANALYSIS: " + json.dumps(report), flush=True)
+
             # Database is saved when db.__exit__ is called
             progress("Saving the database")
     except Exception as e:
@@ -169,6 +206,7 @@ if __name__ == "__main__":
 # Must match what WORKER_SCRIPT prints and exits with.
 WORKER_PROBLEM = "IDASLICER-PROBLEM: "
 WORKER_PROGRESS = "IDASLICER-PROGRESS: "
+WORKER_ANALYSIS = "IDASLICER-ANALYSIS: "
 WORKER_EXIT_PROBLEMS = 2
 # Must match the netnode WORKER_SCRIPT writes: a slice's source binary, file
 # name at supval 0 and input-file MD5 (hex, "" when unknown) at supval 1.
@@ -1833,6 +1871,12 @@ def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int
             ok = ida_typeinf.parse_decls(None, block, None, ida_typeinf.HTI_DCL) == 0  # ty:ignore[invalid-argument-type]
             check(ok, "local type", f"IDA cannot parse {block.splitlines()[0]}, so it may be incomplete")
 
+    # add_func() fails on bytes that are not code yet, as in a fresh slice.
+    unexplored = [start + delta for start, _ in data.get("functions", []) if ida_bytes.is_unknown(ida_bytes.get_flags(start + delta))]
+    for start in unexplored:
+        ida_auto.auto_make_proc(start)
+    if unexplored:
+        ida_auto.auto_wait()
     for start, end in data.get("functions", []):
         start, end = start + delta, end + delta
         pfn = ida_funcs.get_func(start)
@@ -2520,6 +2564,13 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.slice_button = QtWidgets.QPushButton("Slice and Create IDA Database")
         self.slice_button.clicked.connect(self.on_slice_clicked)
         type_layout.addWidget(self.slice_button)
+        self.slice_analysis_check = QtWidgets.QCheckBox("With user analysis")
+        self.slice_analysis_check.setToolTip(
+            "Carry this database's function bounds, names, types, function comments,\n"
+            "bookmarks and decompiler edits within the listed ranges into the slice,\n"
+            "and let IDA finish analysing it before it is saved."
+        )
+        type_layout.addWidget(self.slice_analysis_check)
         # A non-zero stretch factor takes all spare width, so the edit and button keep their natural size.
         type_layout.addStretch(1)
         self.layout.addLayout(type_layout)
@@ -2584,7 +2635,7 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
             QtWidgets.QMessageBox.warning(self.parent, "Error", "Please enter a file type.")
             return
 
-        self.plugin.perform_slice(self.table.entries, file_type_str)
+        self.plugin.perform_slice(self.table.entries, file_type_str, with_analysis=self.slice_analysis_check.isChecked())
 
     def on_save_seg_clicked(self):
         self.plugin.save_segments_to_files(self.table.entries, merge=self.merge_check.isChecked())
@@ -3138,7 +3189,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         base_ftype = ftype_map.get(ftype_enum, "unknown")
         return f"{base_ftype}_{proc_name}"
 
-    def perform_slice(self, entries: list[SlicerEntry], file_type_str):
+    def perform_slice(self, entries: list[SlicerEntry], file_type_str, with_analysis: bool = False):
         entries = _export_entries(entries)
         if not entries:
             print("No entries to slice.")
@@ -3160,7 +3211,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
         ida_kernwin.show_wait_box("Reading ranges...")
         try:
-            report = self._slice(entries, template_path, out_path)
+            report = self._slice(entries, template_path, out_path, with_analysis)
         finally:
             ida_kernwin.hide_wait_box()
         if report is None:
@@ -3170,7 +3221,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         print(f"[IDASlicer] {title}: {text}")
         getattr(QtWidgets.QMessageBox, kind)(None, title, text)
 
-    def _slice(self, entries: list[SlicerEntry], template_path: str, out_path: str) -> tuple[str, str, str] | None:
+    def _slice(self, entries: list[SlicerEntry], template_path: str, out_path: str, with_analysis: bool) -> tuple[str, str, str] | None:
         """The work of `perform_slice`, under its wait box. Returns what to report
         as (QMessageBox method, title, text), or None when the user cancelled."""
         entries_data = []
@@ -3200,6 +3251,15 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         except ScanCancelled:
             return None
 
+        analysis = None
+        if with_analysis:
+            ida_kernwin.replace_wait_box("Exporting the user analysis...")
+            data = export_user_data(ranges=_merge_intervals((e.start, e.end) for e in entries))
+            # The slice's bytes already hold the patched values, where import
+            # would look for the original ones.
+            data["patches"] = []
+            analysis = (os.path.dirname(os.path.realpath(__file__)), data)
+
         try:
             shutil.copy(template_path, out_path)
         except OSError as e:
@@ -3211,7 +3271,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         try:
             with os.fdopen(data_fd, "wb") as f:
                 source = [name or "" for name in source_binary()]
-                pickle.dump((out_path, ida_ida.inf_get_cc_id(), ida_nalt.get_imagebase(), source, entries_data), f)
+                pickle.dump((out_path, ida_ida.inf_get_cc_id(), ida_nalt.get_imagebase(), source, entries_data, analysis), f)
 
             with os.fdopen(script_fd, "w") as f:
                 f.write(WORKER_SCRIPT)
@@ -3247,10 +3307,22 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         if returncode not in (0, WORKER_EXIT_PROBLEMS):
             return "critical", "Error", f"Subprocess failed:\n{output}"
         problems += [line.removeprefix(WORKER_PROBLEM) for line in output.splitlines() if line.startswith(WORKER_PROBLEM)]
+        analysis_report = ""
+        if with_analysis:
+            reports = [json.loads(line.removeprefix(WORKER_ANALYSIS)) for line in output.splitlines() if line.startswith(WORKER_ANALYSIS)]
+            done, failed = (reports[-1]["done"], reports[-1]["problems"]) if reports else ({}, ["the worker did not report on it"])
+            lines = ["User analysis applied:"] + [f"  {kind}: {n}" for kind, n in sorted(done.items())]
+            print("[IDASlicer] " + "\n".join(lines + failed))
+            if failed:
+                shown = failed[:_PROBLEMS_SHOWN]
+                lines += [f"{len(failed)} item(s) could not be applied (all are listed in the Output window):", *shown]
+                if len(failed) > len(shown):
+                    lines.append("...")
+            analysis_report = "\n\n" + "\n".join(lines)
         if problems:
             detail = "\n".join(problems)
-            return "warning", "Slice incomplete", f"Saved to:\n{out_path}\n\nThese ranges are missing or incomplete:\n{detail}"
-        return "information", "Success", f"File saved to:\n{out_path}"
+            return "warning", "Slice incomplete", f"Saved to:\n{out_path}\n\nThese ranges are missing or incomplete:\n{detail}{analysis_report}"
+        return "information", "Success", f"File saved to:\n{out_path}{analysis_report}"
 
     @staticmethod
     def _collect_names(start, end):

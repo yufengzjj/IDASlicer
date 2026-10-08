@@ -246,6 +246,23 @@ def test_import_into_a_rebuilt_database(edits, sample_elf, tmp_path):
     assert after == before
 
 
+def test_slice_with_user_analysis(edits, db, plugin, qt, tmp_path):
+    origins = {}
+    plugin._add_collected_ranges(idaslicer.collect_recursive_ranges(db.ea("root"), origins), origins)
+    ranges = idaslicer._merge_intervals((e.start, e.end) for e in plugin.entries)
+    before = _json(idaslicer.export_user_data(ranges=ranges))
+    plugin.perform_slice(plugin.entries, plugin.detect_file_type(), with_analysis=True)
+    kind, title, text = qt.box.calls[-1]
+    assert (kind, title) == ("information", "Success"), qt.box.calls
+    assert "User analysis applied:" in text and "could not be applied" not in text, text
+
+    sliced = db.path.with_name(db.path.stem + "_slice.i64")
+    after = userdata_child.run(sliced, tmp_path / "out.json")["export"]
+    for key in ("functions", "names", "applied_types", "func_comments", "bookmarks", "decompiler"):
+        assert after[key] == before[key], key
+    assert set(idaslicer._type_blocks(before["types"])) <= set(idaslicer._type_blocks(after["types"]))
+
+
 _SLICE_EDITS = """
 import ida_auto, ida_bytes, ida_funcs, ida_hexrays, ida_name, ida_typeinf
 for ea in {funcs}:
