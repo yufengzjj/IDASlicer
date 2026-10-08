@@ -46,6 +46,7 @@ def run_worker(data_path):
         import ida_ida
         import ida_segment
         import ida_name
+        import ida_netnode
         import ida_typeinf
     except ImportError:
         print(traceback.format_exc())
@@ -59,6 +60,12 @@ def run_worker(data_path):
             out_path, cc_id, entries_data = pickle.load(f)
 
         with ida_domain.Database.open(out_path) as db:
+            # IDA can drop the Root Node while opening (docs/worker-corrupt-i64);
+            # saving then writes a database that cannot be opened again.
+            if ida_netnode.netnode("Root Node", 0, False).index() == ida_netnode.BADNODE:
+                db.save_on_close = False
+                print(f"{out_path}: IDA lost the database's Root Node while opening it; nothing was saved.", file=sys.stderr)
+                sys.exit(1)
             # IDA demangles with the compiler's demangler: in a GNU template an
             # MSVC name shows as `__0foo_std__QEAA_XZ`.
             if cc_id is not None and ida_ida.inf_get_cc_id() != cc_id:
