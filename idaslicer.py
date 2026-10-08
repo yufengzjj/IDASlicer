@@ -22,8 +22,8 @@ import ida_funcs
 import ida_hexrays
 import ida_ida
 import ida_idaapi
+import ida_idp
 import ida_kernwin
-import ida_lines
 import ida_loader
 import ida_moves
 import ida_nalt
@@ -1295,11 +1295,6 @@ def _referenced_types(out: dict) -> set[str]:
         decls += [v["type"] for v in func.get("lvars", {}).get("vars", []) if v["type"]]
         decls += [decl for _, _, decl in func.get("calls", [])]
         names.update(form[7] for form in func.get("numforms", []) if form[7])
-    for _, _, kind, *args in out["operands"]:
-        if kind == "enum":
-            names.add(args[0])
-        elif kind == "stroff":
-            names.update(args[0])
     for decl in decls:
         tif = _parse_type(decl)
         if tif is not None:
@@ -1312,67 +1307,48 @@ def _type_blocks(lines: list[str]) -> list[str]:
     return [b.strip() for b in _TYPE_BLOCK.split("\n".join(lines)) if b.strip()]
 
 
-def _export_functions(out: dict):
-    for start in idautils.Functions():
-        pfn = ida_funcs.get_func(start)
-        if pfn is None:
-            continue
-        out["functions"].append([start, pfn.end_ea])
-        for rpt in (False, True):
-            text = ida_funcs.get_func_cmt(pfn, rpt)
-            if text:
-                out["func_comments"].append([start, rpt, text])
+def _in_ranges(ea: int, ranges: list[tuple[int, int]]) -> bool:
+    """`ranges` sorted and disjoint."""
+    i = bisect.bisect_right(ranges, (ea, ida_idaapi.BADADDR)) - 1
+    return i >= 0 and ea < ranges[i][1]
 
 
-def _export_heads(out: dict):
-    shifts = [ida_bytes.get_operand_type_shift(n) for n in range(ida_ida.UA_MAXOP)]
-    op_mask = 0
-    for shift in shifts:
-        op_mask |= ida_bytes.MS_N_TYPE << shift
-    names = {}
-    for ea in idautils.Heads():
-        f = ida_bytes.get_flags(ea)
-        if ida_bytes.has_user_name(f):
-            # A local label has no global name.
-            names[ea] = [ea, ida_name.get_ea_name(ea, ida_name.GN_LOCAL), not ida_name.get_ea_name(ea, 0)]
-        if ida_bytes.has_cmt(f):
+def _export_functions(out: dict, ranges: list[tuple[int, int]]):
+    seen = set()
+    for start_ea, end_ea in ranges:
+        for start in idautils.Functions(start_ea, end_ea):
+            # Functions() also yields the function containing start_ea.
+            if start in seen or not start_ea <= start < end_ea:
+                continue
+            seen.add(start)
+            pfn = ida_funcs.get_func(start)
+            if pfn is None:
+                continue
+            out["functions"].append([start, pfn.end_ea])
             for rpt in (False, True):
-                text = ida_bytes.get_cmt(ea, rpt)
+                text = ida_funcs.get_func_cmt(pfn, rpt)
                 if text:
-                    out["comments"].append([ea, rpt, text])
-        if ida_bytes.has_extra_cmts(f):
-            for prev, base in ((True, ida_lines.E_PREV), (False, ida_lines.E_NEXT)):
-                lines = []
-                while (line := ida_lines.get_extra_cmt(ea, base + len(lines))) is not None:
-                    lines.append(line)
-                if lines:
-                    out["extra_comments"].append([ea, prev, lines])
-        # Functions, data, and call instructions given a call type.
-        if ida_nalt.is_userti(ea):
-            out["applied_types"].append([ea, _applied_type(ea)])
-        if not f & op_mask:
-            continue
-        for n, shift in enumerate(shifts):
-            kind = (f >> shift) & ida_bytes.MS_N_TYPE
-            if kind == ida_bytes.FF_N_ENUM:
-                tid, serial = ida_bytes.get_enum_id(ea, n)
-                out["operands"].append([ea, n, "enum", ida_typeinf.get_tid_name(tid), serial])
-            elif kind == ida_bytes.FF_N_STRO:
-                path, delta = ida_bytes.get_stroff_path(ea, n)  # ty:ignore[too-many-positional-arguments]
-                if path:
-                    out["operands"].append([ea, n, "stroff", [ida_typeinf.get_tid_name(t) for t in path], delta])
-            elif kind == ida_bytes.FF_N_FOP:
-                text = ida_bytes.get_forced_operand(ea, n)
-                if text is not None:
-                    out["operands"].append([ea, n, "forced", text])
+                    out["func_comments"].append([start, rpt, text])
+
+
+def _export_heads(out: dict, ranges: list[tuple[int, int]]):
+    names = {}
+    for start_ea, end_ea in ranges:
+        for ea in idautils.Heads(start_ea, end_ea):
+            if ida_bytes.has_user_name(ida_bytes.get_flags(ea)):
+                # A local label has no global name, and Names() leaves it out.
+                names[ea] = [ea, ida_name.get_ea_name(ea, ida_name.GN_LOCAL), not ida_name.get_ea_name(ea, 0)]
+            # Functions, data, and call instructions given a call type.
+            if ida_nalt.is_userti(ea):
+                out["applied_types"].append([ea, _applied_type(ea)])
     # Names on bytes that are not item heads, e.g. unexplored ones.
     for ea, name in idautils.Names():
-        if ea not in names and ida_bytes.has_user_name(ida_bytes.get_flags(ea)):
+        if ea not in names and _in_ranges(ea, ranges) and ida_bytes.has_user_name(ida_bytes.get_flags(ea)):
             names[ea] = [ea, name, False]
     out["names"] = [names[ea] for ea in sorted(names)]
 
 
-def _export_patches(out: dict):
+def _export_patches(out: dict, ranges: list[tuple[int, int]]):
     runs = []
 
     def visit(ea, fpos, original, value):
@@ -1383,14 +1359,15 @@ def _export_patches(out: dict):
             runs.append([ea, [original], [value]])
         return 0
 
-    ida_bytes.visit_patched_bytes(0, ida_idaapi.BADADDR, visit)
+    for start_ea, end_ea in ranges:
+        ida_bytes.visit_patched_bytes(start_ea, end_ea, visit)
     out["patches"] = [[ea, bytes(orig).hex(), bytes(val).hex()] for ea, orig, val in runs]
 
 
-def _export_bookmarks(out: dict):
+def _export_bookmarks(out: dict, ranges: list[tuple[int, int]]):
     for slot in range(ida_moves.MAX_MARK_SLOT + 1):
         ea = idc.get_bookmark(slot)
-        if ea is not None and ea != ida_idaapi.BADADDR:
+        if ea is not None and ea != ida_idaapi.BADADDR and _in_ranges(ea, ranges):
             out["bookmarks"].append([slot, ea, idc.get_bookmark_desc(slot) or ""])
 
 
@@ -1457,13 +1434,15 @@ def _export_decompiler(func_starts: list[int], out: dict) -> list | None:
     return funcs
 
 
-def export_user_data(all_types: bool | None = None) -> dict:
+def export_user_data(all_types: bool | None = None, ranges: list[tuple[int, int]] | None = None) -> dict:
     """What the user added to the analysis -- patched bytes, names, types,
-    comments, operand representation, bookmarks and decompiler edits -- for
-    import_user_data() to apply to a fresh database of the same binary. IDA does
+    function comments, bookmarks and decompiler edits -- for import_user_data()
+    to apply to a fresh database of the same binary. IDA does
     not record which local types the user wrote, so only those the rest of the
     export refers to go out, with what they depend on; `all_types` (default:
-    the export_all_types setting) exports every one."""
+    the export_all_types setting) exports every one. `ranges` (sorted, disjoint
+    `(start, end)` pairs) limits the export to what lies in them, functions by
+    their start."""
     if all_types is None:
         all_types = SETTINGS["export_all_types"]
     md5 = ida_nalt.retrieve_input_file_md5()
@@ -1479,17 +1458,16 @@ def export_user_data(all_types: bool | None = None) -> dict:
         "functions": [],
         "names": [],
         "applied_types": [],
-        "comments": [],
-        "extra_comments": [],
         "func_comments": [],
-        "operands": [],
         "bookmarks": [],
         "decompiler": None,
     }
-    _export_patches(out)
-    _export_functions(out)
-    _export_heads(out)
-    _export_bookmarks(out)
+    if ranges is None:
+        ranges = [(ida_ida.inf_get_min_ea(), ida_ida.inf_get_max_ea())]
+    _export_patches(out, ranges)
+    _export_functions(out, ranges)
+    _export_heads(out, ranges)
+    _export_bookmarks(out, ranges)
     out["decompiler"] = _export_decompiler([start for start, _ in out["functions"]], out)
     out["types"] = _export_types(None if all_types else _referenced_types(out))
     return out
@@ -1648,30 +1626,6 @@ def import_user_data(data: dict, shift: bool = True) -> tuple[collections.Counte
         ok = tif is not None and (ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE) or _applied_type(ea) == decl)
         check(ok, "type at address", f"{hex(ea)}: {decl}")
 
-    for ea, n, kind, *args in data.get("operands", []):
-        ea += delta
-        if kind == "enum":
-            tid = ida_typeinf.get_named_type_tid(args[0])
-            ok = tid != ida_idaapi.BADADDR and ida_bytes.op_enum(ea, n, tid, args[1])
-        elif kind == "stroff":
-            path = [ida_typeinf.get_named_type_tid(t) for t in args[0]]
-            insn = ida_ua.insn_t()  # ty:ignore[missing-argument]
-            ok = ida_idaapi.BADADDR not in path and ida_ua.decode_insn(insn, ea) > 0 and ida_bytes.op_stroff(insn, n, path, args[1])  # ty:ignore[too-many-positional-arguments]
-        elif kind == "forced":
-            ok = ida_bytes.set_forced_operand(ea, n, args[0])
-        else:
-            ok = False
-        check(ok, "operand", f"{hex(ea)} operand {n}: {kind} {args}")
-
-    for ea, rpt, text in data.get("comments", []):
-        check(ida_bytes.set_cmt(ea + delta, text, rpt), "comment", hex(ea + delta))
-    for ea, prev, lines in data.get("extra_comments", []):
-        ea += delta
-        base = ida_lines.E_PREV if prev else ida_lines.E_NEXT
-        ida_lines.delete_extra_cmts(ea, base)
-        for i, line in enumerate(lines):
-            ida_lines.update_extra_cmt(ea, base + i, line)
-        done["extra comment lines"] += len(lines)
     for ea, rpt, text in data.get("func_comments", []):
         pfn = ida_funcs.get_func(ea + delta)
         check(pfn is not None and ida_funcs.set_func_cmt(pfn, text, rpt), "function comment", hex(ea + delta))
@@ -1742,10 +1696,7 @@ def _userdata_counts(data: dict) -> str:
         "functions": "functions",
         "names": "names",
         "applied_types": "types at addresses",
-        "comments": "comments",
-        "extra_comments": "extra comment blocks",
         "func_comments": "function comments",
-        "operands": "operand representations",
         "bookmarks": "bookmarks",
     }
     parts = [f"{len(data[key])} {label}" for key, label in labels.items()]
@@ -1757,6 +1708,50 @@ def _userdata_counts(data: dict) -> str:
 
 def _autosave_dir() -> str:
     return os.path.splitext(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))[0] + ".userdata"
+
+
+# Events that can change what export_user_data() writes, apart from decompiler
+# edits: those made through the API (scripts) raise no event at all.
+_IDB_CHANGE_EVENTS = (
+    "renamed",
+    "ti_changed",
+    "local_types_changed",
+    "local_type_renamed",
+    "byte_patched",
+    "func_added",
+    "func_deleted",
+    "func_updated",
+    "set_func_start",
+    "set_func_end",
+    "range_cmt_changed",
+    "bookmark_changed",
+)
+
+
+class _ChangeTracker:
+    """Whether the user's analysis may have changed since the last auto-export,
+    so it can skip walking every head of a database that did not."""
+
+    def __init__(self):
+        self.changed = True
+        self.decompiler = None  # the "decompiler" part of the last export
+
+        def note(_hooks, *args):
+            self.changed = True
+            return 0
+
+        self._hooks = type("_ChangeHooks", (ida_idp.IDB_Hooks,), dict.fromkeys(_IDB_CHANGE_EVENTS, note))()
+
+    def hook(self):
+        self._hooks.hook()
+
+    def unhook(self):
+        self._hooks.unhook()
+
+    def needs_export(self) -> bool:
+        # The decompiler part costs a few calls per function, not per head.
+        funcs = list(dict.fromkeys(idautils.Functions()))
+        return self.changed or _export_decompiler(funcs, {"not_exported": []}) != self.decompiler
 
 
 # --- UI Components ---
@@ -2203,7 +2198,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.autosave_spin.setSpecialValueText("Off")
         self.autosave_spin.setValue(SETTINGS["autosave_minutes"])
         self.autosave_spin.setToolTip(
-            "Export your names, types, comments and decompiler edits to a folder next\n"
+            "Export your names, types, function comments and decompiler edits to a folder next\n"
             "to the database (<database>.userdata) this often, so they survive a\n"
             "database IDA can no longer open. Skipped while auto-analysis runs, and\n"
             "when nothing changed since the last export."
@@ -2217,9 +2212,9 @@ class SettingsDialog(QtWidgets.QDialog):
         self.all_types_check.setToolTip(
             "IDA does not record which local types you wrote. By default an export\n"
             "holds only the types used by the exported function, data and call\n"
-            "types, decompiler variables and operands, plus the types they depend\n"
-            "on. Turn this on to keep types nothing uses yet, or library types you\n"
-            "edited that only IDA's own prototypes use."
+            "types and decompiler edits, plus the types they depend on. Turn this\n"
+            "on to keep types nothing uses yet, or library types you edited that\n"
+            "only IDA's own prototypes use."
         )
         layout.addRow("Auto-export analysis every:", self.autosave_spin)
         layout.addRow("Automatic exports to keep:", self.keep_spin)
@@ -2300,9 +2295,16 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
 
         analysis_layout = QtWidgets.QHBoxLayout()
         self.export_analysis_button = QtWidgets.QPushButton("Export user analysis...")
-        self.export_analysis_button.setToolTip("Save your names, types, comments and decompiler edits to a file")
-        self.export_analysis_button.clicked.connect(self.plugin.export_analysis)
+        self.export_analysis_button.setToolTip("Save your names, types, function comments and decompiler edits to a file")
+        self.export_analysis_button.clicked.connect(lambda: self.plugin.export_analysis(self.analysis_ranges_check.isChecked()))
         analysis_layout.addWidget(self.export_analysis_button)
+        self.analysis_ranges_check = QtWidgets.QCheckBox("Only the listed ranges")
+        self.analysis_ranges_check.setToolTip(
+            "Export only what lies in the ranges of the slicer list, e.g. to carry\n"
+            "this database's analysis into a slice made from them. Functions count\n"
+            "by their start. The automatic export always covers the whole database."
+        )
+        analysis_layout.addWidget(self.analysis_ranges_check)
         self.import_analysis_button = QtWidgets.QPushButton("Import user analysis...")
         self.import_analysis_button.setToolTip("Apply an exported analysis to this database, e.g. one rebuilt after a crash")
         self.import_analysis_button.clicked.connect(self.plugin.import_analysis)
@@ -2430,6 +2432,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.register_actions()
         self.hooks = SlicerUIHooks(self)  # ty:ignore[missing-argument]
         self.hooks.hook()
+        self._changes = _ChangeTracker()
+        self._changes.hook()
         self._last_autosave = time.monotonic()
         self._autosave_timer = ida_kernwin.register_timer(_AUTOSAVE_TICK_MS, self._autosave_tick)
         return ida_idaapi.PLUGIN_KEEP
@@ -2493,6 +2497,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.unregister_actions()
         if hasattr(self, "hooks"):
             self.hooks.unhook()
+        if hasattr(self, "_changes"):
+            self._changes.unhook()
         if getattr(self, "_autosave_timer", None):
             ida_kernwin.unregister_timer(self._autosave_timer)
 
@@ -2501,22 +2507,36 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         if minutes and time.monotonic() - self._last_autosave >= minutes * 60 and ida_auto.auto_is_ok():
             self._last_autosave = time.monotonic()
             try:
-                path = save_rotating(_autosave_dir(), format_user_data(export_user_data()), SETTINGS["autosave_keep"])
+                self._autosave()
             except Exception as e:  # noqa: BLE001 -- the timer must keep running
+                self._changes.changed = True
                 print(f"[IDASlicer] Analysis auto-export failed: {e}")
-            else:
-                if path:
-                    print(f"[IDASlicer] Analysis auto-exported to {path}")
         return _AUTOSAVE_TICK_MS
 
-    def export_analysis(self):
+    def _autosave(self):
+        if not self._changes.needs_export():
+            return
+        self._changes.changed = False
+        data = export_user_data()
+        self._changes.decompiler = data["decompiler"]
+        path = save_rotating(_autosave_dir(), format_user_data(data), SETTINGS["autosave_keep"])
+        if path:
+            print(f"[IDASlicer] Analysis auto-exported to {path}")
+
+    def export_analysis(self, listed_ranges: bool = False):
+        ranges = None
+        if listed_ranges:
+            if not self.entries:
+                QtWidgets.QMessageBox.warning(None, "Nothing to export", "The slicer list is empty, so it has no ranges to export.")
+                return
+            ranges = _merge_intervals((e.start, e.end) for e in self.entries)
         default = os.path.splitext(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))[0] + ".userdata.json"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(None, "Export user analysis", default, "Analysis export (*.json)")
         if not path:
             return
         ida_kernwin.show_wait_box("Exporting user analysis...")
         try:
-            data = export_user_data()
+            data = export_user_data(ranges=ranges)
             write_user_data(path, format_user_data(data))
         except Exception as e:  # noqa: BLE001
             print(f"[IDASlicer] Analysis export failed: {e}")
@@ -2525,6 +2545,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         finally:
             ida_kernwin.hide_wait_box()
         summary = f"Exported to {path}:\n{_userdata_counts(data)}"
+        if ranges is not None:
+            summary = f"Only what lies in {len(ranges)} ranges of the slicer list -- not a full backup.\n{summary}"
         if data["not_exported"]:
             summary += "\n\nNot exported:\n" + "\n".join(data["not_exported"])
         print(f"[IDASlicer] {summary}")

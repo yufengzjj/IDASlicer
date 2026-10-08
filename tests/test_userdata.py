@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import time
 
 import ida_auto
 import ida_bytes
@@ -8,13 +9,11 @@ import ida_funcs
 import ida_hexrays
 import ida_idaapi
 import ida_idp
-import ida_lines
 import ida_nalt
 import ida_name
 import ida_pro
 import ida_segment
 import ida_typeinf
-import ida_ua
 import idautils
 import idc
 import pytest
@@ -23,22 +22,6 @@ import userdata_child
 import idaslicer
 
 BADADDR = ida_idaapi.BADADDR
-
-
-def _insn(ea):
-    insn = ida_ua.insn_t()  # ty:ignore[missing-argument]
-    assert ida_ua.decode_insn(insn, ea) > 0
-    return insn
-
-
-def _operand(func_ea, optype):
-    """The first (address, operand number) in the function whose operand has this type."""
-    pfn = ida_funcs.get_func(func_ea)
-    for ea in idautils.Heads(pfn.start_ea, pfn.end_ea):
-        for n, op in enumerate(_insn(ea).ops):
-            if op.type == optype:
-                return ea, n
-    raise AssertionError(f"no operand of type {optype} in {func_ea:#x}")
 
 
 def _local_label():
@@ -66,9 +49,9 @@ def _lvar_names(ea):
 def edits(db):
     """One user edit of every kind the export covers."""
     assert ida_hexrays.init_hexrays_plugin(), "the tests need the arm64 decompiler"
-    e = {name: db.ea(name) for name in ("root", "leaf", "walk", "via_ptr2", "g_n1", "g_msg")}
+    e = {name: db.ea(name) for name in ("root", "leaf", "walk", "g_n1", "g_msg")}
     decls = (
-        "struct Node { Node *next; int v; }; enum Mask { MASK_55 = 0x55 }; struct Unused { int u; };"
+        "struct Node { Node *next; int v; }; struct Unused { int u; };"
         "enum Kind { KIND_A }; struct Leaf { int x; }; struct Inner { Leaf leaf; Kind kind; }; struct Tail { int t; };"
         "struct Payload { int a; Inner *in; Tail *tails[2]; }; typedef Payload *PayloadRef;"
     )
@@ -89,20 +72,7 @@ def edits(db):
     assert ida_typeinf.apply_tinfo(e["walk"], proto, ida_typeinf.TINFO_DEFINITE)
     assert ida_typeinf.apply_tinfo(e["g_n1"], idaslicer._parse_type("Node x;"), ida_typeinf.TINFO_DEFINITE)
 
-    assert ida_bytes.set_cmt(e["root"], "regular", False)
-    assert ida_bytes.set_cmt(e["root"], "repeatable", True)
-    ida_lines.update_extra_cmt(e["root"], ida_lines.E_PREV, "before 1")
-    ida_lines.update_extra_cmt(e["root"], ida_lines.E_PREV + 1, "before 2")
-    ida_lines.update_extra_cmt(e["root"], ida_lines.E_NEXT, "after")
     assert ida_funcs.set_func_cmt(ida_funcs.get_func(e["leaf"]), "leaf comment", True)
-
-    e["stroff"] = _operand(e["walk"], ida_ua.o_displ)
-    assert ida_bytes.op_stroff(_insn(e["stroff"][0]), e["stroff"][1], [ida_typeinf.get_named_type_tid("Node")], 0)
-    e["enum"] = _operand(e["via_ptr2"], ida_ua.o_imm)
-    assert ida_bytes.op_enum(*e["enum"], ida_typeinf.get_named_type_tid("Mask"), 0)
-    e["forced"] = (e["root"], 0)
-    assert ida_bytes.set_forced_operand(*e["forced"], "FORCED")
-
     idc.put_bookmark(e["leaf"], 0, 0, 0, 3, "look here")
 
     lvars = ida_hexrays.decompile(e["root"]).get_lvars()
@@ -146,15 +116,11 @@ def test_export_keeps_only_user_edits(edits):
     assert not [n for n, _ in names.values() if n.startswith(("sub_", "loc_", "dword_", "off_", "unk_"))]
     assert data["patches"] == [[edits["g_msg"], edits["original"].hex(), b"HELLO".hex()]]
     assert {ea for ea, _ in data["applied_types"]} == {edits["walk"], edits["g_n1"], edits["call"]}
-    assert [edits["root"], True, ["before 1", "before 2"]] in data["extra_comments"]
-    assert [edits["root"], False, ["after"]] in data["extra_comments"]
     assert data["func_comments"] == [[edits["leaf"], True, "leaf comment"]]
-    ops = {(ea, n): kind for ea, n, kind, *_ in data["operands"]}
-    assert ops == {edits["stroff"]: "stroff", edits["enum"]: "enum", edits["forced"]: "forced"}
     assert data["bookmarks"] == [[3, edits["leaf"], "look here"]]
     # Only the call type names PayloadRef; the rest of its chain comes from the types themselves.
     chain = {"typedef Payload *PayloadRef;", "struct Payload", "struct Inner", "struct Tail", "struct Leaf", "enum Kind"}
-    assert {"struct Node", "enum Mask"} | chain <= _type_heads(data)
+    assert {"struct Node"} | chain <= _type_heads(data)
     assert not any("Unused" in line or "short float" in line for line in data["types"])
     (root_hr,) = [f for f in data["decompiler"] if f["ea"] == edits["root"]]
     assert "count" in [v["name"] for v in root_hr["lvars"]["vars"]]
@@ -173,6 +139,37 @@ def test_export_all_types(edits, monkeypatch):
     assert any("short float" in line for line in every["types"])
     monkeypatch.setitem(idaslicer.SETTINGS, "export_all_types", True)
     assert idaslicer.export_user_data() == every
+
+
+def test_export_limited_to_ranges(edits):
+    leaf, root = ida_funcs.get_func(edits["leaf"]), edits["root"]
+    # root's own start lies outside, so root is not exported.
+    ranges = idaslicer._merge_intervals([(leaf.start_ea, leaf.end_ea), (edits["g_msg"], edits["g_msg"] + 16), (root + 4, root + 8)])
+    full, part = idaslicer.export_user_data(), idaslicer.export_user_data(ranges=ranges)
+    inside = lambda ea: any(s <= ea < e for s, e in ranges)
+    assert [edits["leaf"], "my_leaf", False] in part["names"]
+    assert part["names"] == [n for n in full["names"] if inside(n[0])]
+    assert part["applied_types"] == [t for t in full["applied_types"] if inside(t[0])]
+    assert part["patches"] == full["patches"] != []
+    assert part["functions"] == [[leaf.start_ea, leaf.end_ea]]
+    assert part["func_comments"] == full["func_comments"] != []
+    assert part["bookmarks"] == full["bookmarks"] != []
+    assert part["decompiler"] == [f for f in full["decompiler"] if f["ea"] == leaf.start_ea]
+
+
+def test_panel_exports_the_listed_ranges(edits, plugin, qt, tmp_path):
+    plugin.export_analysis(True)
+    assert [c[:2] for c in qt.box.calls] == [("warning", "Nothing to export")]
+    origins = {}
+    plugin._add_collected_ranges(idaslicer.collect_function_ranges(edits["leaf"], origins), origins, recursive=False)
+    path = tmp_path / "ranges.json"
+    qt.files.files = [str(path)]
+    plugin.export_analysis(True)
+    assert qt.box.calls[-1][:2] == ("information", "Analysis exported"), qt.box.calls
+    count = len(idaslicer._merge_intervals((e.start, e.end) for e in plugin.entries))
+    assert f"Only what lies in {count} ranges of the slicer list -- not a full backup" in qt.box.calls[-1][2]
+    data = idaslicer.load_user_data(str(path))
+    assert [start for start, _ in data["functions"]] == [edits["leaf"]]
 
 
 @pytest.mark.xfail(strict=True, raises=AssertionError, reason="create_struct (Alt+Q) stores no type at the address, so no is_userti")
@@ -199,14 +196,7 @@ def _wipe(e):
     ida_name.del_local_name(e["label"])
     ida_nalt.del_tinfo(e["walk"])
     ida_nalt.del_tinfo(e["g_n1"])
-    ida_bytes.set_cmt(e["root"], "", False)
-    ida_bytes.set_cmt(e["root"], "", True)
-    ida_lines.delete_extra_cmts(e["root"], ida_lines.E_PREV)
-    ida_lines.delete_extra_cmts(e["root"], ida_lines.E_NEXT)
     ida_funcs.set_func_cmt(ida_funcs.get_func(e["leaf"]), "changed", True)
-    for ea, n in (e["stroff"], e["enum"]):
-        ida_bytes.clr_op_type(ea, n)
-    ida_bytes.set_forced_operand(*e["forced"], "")
     ida_typeinf.parse_decls(None, "struct Node { int other; };", None, ida_typeinf.HTI_DCL)
     ida_hexrays.rename_lvar(e["root"], "count", "renamed")
     for kind in ("cmts", "labels", "numforms", "iflags", "unions"):
@@ -256,7 +246,7 @@ for ea in {funcs}:
     ida_funcs.add_func(ea)
 ida_auto.auto_wait()
 ida_name.set_name({callee}, "slice_callee", ida_name.SN_NOCHECK)
-ida_bytes.set_cmt({callee}, "from the slice", False)
+ida_funcs.set_func_cmt(ida_funcs.get_func({callee}), "from the slice", False)
 ida_typeinf.parse_decls(None, "struct SliceS {{ int a; int b; }};", None, ida_typeinf.HTI_DCL)
 ida_typeinf.apply_tinfo({via}, idaslicer._parse_type("int __fastcall f(SliceS *s);"), ida_typeinf.TINFO_DEFINITE)
 assert ida_hexrays.init_hexrays_plugin()
@@ -285,18 +275,18 @@ def test_edits_made_in_a_slice_go_back_to_the_source(edits, db, plugin, qt, tmp_
     _, problems = idaslicer.import_user_data(from_slice)
     assert problems == []
     assert ida_name.get_ea_name(callee, 0) == "slice_callee"
-    assert ida_bytes.get_cmt(callee, False) == "from the slice"
+    assert ida_funcs.get_func_cmt(ida_funcs.get_func(callee), False) == "from the slice"
     assert "SliceS" in idaslicer._applied_type(via)
     assert "slice_var" in _lvar_names(fill)
 
     after = _json(idaslicer.export_user_data())
     before = _json(before)
-    for key in ("patches", "functions", "extra_comments", "func_comments", "operands", "bookmarks"):
+    for key in ("patches", "functions", "bookmarks"):
         assert after[key] == before[key], key
     names = lambda d: {tuple(n) for n in d["names"]}
     assert names(after) - names(before) == {(callee, "slice_callee", False)}
     assert names(before) - names(after) == {(callee, "callee_a", False)}
-    assert [c for c in after["comments"] if c not in before["comments"]] == [[callee, False, "from the slice"]]
+    assert [c for c in after["func_comments"] if c not in before["func_comments"]] == [[callee, False, "from the slice"]]
     assert [t for t in after["applied_types"] if t not in before["applied_types"]] == [[via, idaslicer._applied_type(via)]]
     others = lambda d: [f for f in d["decompiler"] if f["ea"] != fill]
     assert others(after) == others(before)
@@ -338,15 +328,14 @@ def test_import_follows_a_new_image_base(edits):
     before = idaslicer.export_user_data()
     delta = 0x100000
     assert ida_segment.rebase_program(delta, ida_segment.MSF_FIXONCE) == 0
-    moved = {k: (v[0] + delta, v[1]) if isinstance(v, tuple) else v if isinstance(v, bytes) else v + delta for k, v in edits.items()}
+    moved = {k: v if isinstance(v, bytes) else v + delta for k, v in edits.items()}
     _wipe(moved)
     assert idaslicer.shift_by_image_base(before) is True
     _, problems = idaslicer.import_user_data(before)
     assert problems == []
     assert ida_name.get_ea_name(moved["leaf"], 0) == "my_leaf"
     assert ida_bytes.get_bytes(moved["g_msg"], 5) == b"HELLO"
-    assert ida_bytes.get_cmt(moved["root"], True) == "repeatable"
-    assert ida_bytes.is_enum(ida_bytes.get_flags(moved["enum"][0]), moved["enum"][1])
+    assert ida_funcs.get_func_cmt(ida_funcs.get_func(moved["leaf"]), True) == "leaf comment"
     assert idc.get_bookmark(3) == moved["leaf"]
     assert "count" in _lvar_names(moved["root"])
 
@@ -395,3 +384,60 @@ def test_panel_export_then_import_asks_about_another_binary(edits, plugin, qt, t
     qt.box.answers["question"] = "Yes"
     plugin.import_analysis()
     assert qt.box.calls[-1][:2] == ("information", "Analysis imported")
+
+
+def test_autosave_skips_an_unchanged_database(edits, plugin, tmp_path, monkeypatch):
+    exports = []
+    real_export = idaslicer.export_user_data
+
+    def export():
+        exports.append(1)
+        if len(exports) == 3:
+            raise OSError("disk full")
+        return real_export()
+
+    monkeypatch.setattr(idaslicer, "export_user_data", export)
+    monkeypatch.setattr(idaslicer, "_autosave_dir", lambda: str(tmp_path / "a.userdata"))
+    monkeypatch.setitem(idaslicer.SETTINGS, "autosave_minutes", 1)
+    # Not hooked: `changed` is set by hand.
+    plugin._changes = idaslicer._ChangeTracker()
+    ida_auto.auto_wait()
+
+    def tick():
+        plugin._last_autosave = time.monotonic() - 3600
+        plugin._autosave_tick()
+        return len(exports)
+
+    assert tick() == 1
+    assert tick() == 1
+    # By name: an earlier test moved the image base.
+    assert ida_hexrays.rename_lvar(ida_name.get_name_ea(BADADDR, "root"), "count", "autosaved_var")
+    assert tick() == 2, "a decompiler edit made through the API raises no event"
+    assert tick() == 2
+    plugin._changes.changed = True
+    assert tick() == 3 and plugin._changes.changed, "a failed export must be retried"
+
+
+def test_change_tracker_notes_every_kind_of_edit(edits):
+    root, leaf, walk, msg = (ida_name.get_name_ea(BADADDR, n) for n in ("root", "my_leaf", "walk", "g_msg"))
+    assert BADADDR not in (root, leaf, walk, msg)
+    tracker = idaslicer._ChangeTracker()
+    tracker.hook()
+    try:
+        tracker.changed = False
+        idaslicer.export_user_data()
+        assert not tracker.changed, "exporting must not count as a change"
+        for kind, edit in [
+            ("name", lambda: ida_name.set_name(leaf, "tracked_leaf", ida_name.SN_NOCHECK)),
+            ("type", lambda: ida_typeinf.apply_tinfo(walk, idaslicer._parse_type("int __fastcall f(int a);"), ida_typeinf.TINFO_DEFINITE)),
+            ("local type", lambda: ida_typeinf.parse_decls(None, "struct Tracked { int t; };", None, ida_typeinf.HTI_DCL)),
+            ("patch", lambda: ida_bytes.patch_byte(msg, ord("J"))),
+            ("function comment", lambda: ida_funcs.set_func_cmt(ida_funcs.get_func(leaf), "tracked", True)),
+            ("function end", lambda: ida_funcs.set_func_end(leaf, ida_funcs.get_func(leaf).end_ea - 4)),
+            ("bookmark", lambda: idc.put_bookmark(root, 0, 0, 0, 4, "tracked")),
+        ]:
+            tracker.changed = False
+            edit()
+            assert tracker.changed, kind
+    finally:
+        tracker.unhook()
