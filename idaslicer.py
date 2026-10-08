@@ -2366,6 +2366,9 @@ class SettingsDialog(QtWidgets.QDialog):
         }
 
 
+FORM_TITLE = "Slicer List"
+
+
 class SlicerPluginForm(ida_kernwin.PluginForm):
     def __init__(self, plugin):
         super().__init__()
@@ -2763,9 +2766,16 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         self.load_config()
         if not self.form:
             self.form = SlicerPluginForm(self)  # ty:ignore[missing-argument]
-        self.form.Show("Slicer List")
+        self.form.Show(FORM_TITLE)
         if self.form:
             self.form.table.refresh()
+
+    def create_form_widget(self):
+        """Build the panel without showing it, for IDA to place where the saved desktop had it."""
+        if not self.form:
+            self.form = SlicerPluginForm(self)  # ty:ignore[missing-argument]
+        self.form.Show(FORM_TITLE, ida_kernwin.PluginForm.WOPN_CREATE_ONLY)
+        return self.form.GetWidget()
 
     def register_actions(self):
         ida_kernwin.register_action(
@@ -3552,6 +3562,13 @@ class SlicerUIHooks(ida_kernwin.UI_Hooks):
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_callers_recursive", "Add to Slicer/")
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_sel", "Add to Slicer/")
             ida_kernwin.attach_action_to_popup(widget, popup, "idaslicer:add_seg", "Add to Slicer/")
+
+    def create_desktop_widget(self, title, cfg):
+        # IDA saves the open panel in the database's desktop and asks for it
+        # back by title when the database is reopened.
+        if title == FORM_TITLE:
+            return self.plugin.create_form_widget()
+        return None
 
 
 def PLUGIN_ENTRY():
