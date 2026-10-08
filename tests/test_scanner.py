@@ -260,6 +260,18 @@ def test_caller_cluster_through_code_no_function_owns(db, leaf_undefined):
     assert [db.label(ea) for ea in idaslicer.get_caller_cluster(leaf_undefined)][:3] == ["leaf", "callee_a", "fill_bss"]
 
 
+def test_progress_in_wait_box(db, monkeypatch):
+    shown = []
+    clock = itertools.count(1)
+    monkeypatch.setattr(idaslicer, "time", types.SimpleNamespace(monotonic=lambda: next(clock)))
+    monkeypatch.setattr(idaslicer, "_last_cancel_check", 0)
+    monkeypatch.setattr(idaslicer.ida_kernwin, "replace_wait_box", shown.append)
+    idaslicer.collect_recursive_ranges_from_callers(db.ea("via_ptr"))
+    assert shown[0].startswith("Finding callers...\n")
+    assert shown[-1].startswith("Scanning references...\n") and shown[-1].endswith(" ranges collected")
+    assert idaslicer._status is None
+
+
 @pytest.fixture
 def leaf_undefined(db):
     """`leaf` with its function deleted, as IDA leaves obfuscated code."""

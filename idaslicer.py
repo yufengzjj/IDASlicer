@@ -628,6 +628,18 @@ class ScanCancelled(Exception):
 
 
 _last_cancel_check = 0.0
+_status = None
+
+
+@contextlib.contextmanager
+def _progress(status):
+    """Show `status()` in the wait box while the block runs, at each UI query of `_check_cancel`."""
+    global _status
+    saved, _status = _status, status
+    try:
+        yield
+    finally:
+        _status = saved
 
 
 def _check_cancel():
@@ -638,6 +650,8 @@ def _check_cancel():
     if now - _last_cancel_check < 0.1:
         return
     _last_cancel_check = now
+    if _status is not None:
+        ida_kernwin.replace_wait_box(_status())
     if ida_kernwin.user_cancelled():
         raise ScanCancelled()
 
@@ -678,6 +692,9 @@ class _FuncQueue:
 
     def add_closure(self, ea: int, origins: dict, ref_from: int | None = None):
         self.pending.extend(get_recursive_functions(ea, origins, ref_from, self.seen))
+
+    def status(self, collected: list):
+        return lambda: f"Scanning references...\n{len(self.seen)} functions found, {len(self.pending)} waiting, {len(collected)} ranges collected"
 
 
 def _inside_func(func, start: int, end: int) -> bool:
@@ -1055,30 +1072,31 @@ def get_caller_cluster(ea) -> list[int]:
     cluster = []
     seen = set()
     work = collections.deque([ea])
-    while work:
-        _check_cancel()
-        ref = work.popleft()
-        flags = ida_bytes.get_flags(ref)
-        func = ida_funcs.get_func(ref)
-        node = func.start_ea if func else ida_bytes.get_item_head(ref)
-        if node in seen:
-            continue
-        seen.add(node)
+    with _progress(lambda: f"Finding callers...\n{len(cluster)} functions found, {len(work)} references waiting"):
+        while work:
+            _check_cancel()
+            ref = work.popleft()
+            flags = ida_bytes.get_flags(ref)
+            func = ida_funcs.get_func(ref)
+            node = func.start_ea if func else ida_bytes.get_item_head(ref)
+            if node in seen:
+                continue
+            seen.add(node)
 
-        if func:
-            cluster.append(node)
-            targets = [h for h in idautils.FuncItems(node) if ida_bytes.has_xref(ida_bytes.get_flags(h))]
-            if ida_bytes.is_flow(ida_bytes.get_flags(node)):
-                prev = ida_bytes.prev_head(node, 0)
-                if prev != idaapi.BADADDR and not _is_call(prev):
-                    work.append(prev)
-        elif ida_bytes.is_code(flags):
-            cluster.append(node)
-            targets = [a for s, e in reconstruct_func_range(node) for a in _referenced_addrs(s, e)]
-        else:
-            targets = _referenced_addrs(node, node + max(ida_bytes.get_item_size(node), 1))
-        for target in targets:
-            work.extend(x.frm for x in idautils.XrefsTo(target, ida_xref.XREF_FAR))
+            if func:
+                cluster.append(node)
+                targets = [h for h in idautils.FuncItems(node) if ida_bytes.has_xref(ida_bytes.get_flags(h))]
+                if ida_bytes.is_flow(ida_bytes.get_flags(node)):
+                    prev = ida_bytes.prev_head(node, 0)
+                    if prev != idaapi.BADADDR and not _is_call(prev):
+                        work.append(prev)
+            elif ida_bytes.is_code(flags):
+                cluster.append(node)
+                targets = [a for s, e in reconstruct_func_range(node) for a in _referenced_addrs(s, e)]
+            else:
+                targets = _referenced_addrs(node, node + max(ida_bytes.get_item_size(node), 1))
+            for target in targets:
+                work.extend(x.frm for x in idautils.XrefsTo(target, ida_xref.XREF_FAR))
     return cluster
 
 
@@ -1214,7 +1232,7 @@ def collect_recursive_ranges(start_ea, origins: dict | None = None) -> list:
         origins = {}
     queue = _FuncQueue()
     collected = []
-    with _keep_partial(collected):
+    with _keep_partial(collected), _progress(queue.status(collected)):
         queue.add_closure(start_ea, origins)
         _drain_functions(queue, collected, _Coverage(), origins)
     return collected
@@ -1232,7 +1250,7 @@ def collect_recursive_ranges_from_range(start, end, origins: dict | None = None)
     queue = _FuncQueue()
     collected = []
     cur_func = ida_funcs.get_func(start) or _NoFunc(start)
-    with _keep_partial(collected):
+    with _keep_partial(collected), _progress(queue.status(collected)):
         _scan_worklist([ida_range.range_t(start, end)], cur_func, collected, queue, processed_ranges, origins)
         _drain_functions(queue, collected, processed_ranges, origins)
     return collected
@@ -1250,7 +1268,7 @@ def collect_recursive_ranges_from_ranges(seed_ranges, origins: dict | None = Non
     queue = _FuncQueue()
     collected = []
     seeds = [ida_range.range_t(s, e) for s, e in seed_ranges if s < e]
-    with _keep_partial(collected):
+    with _keep_partial(collected), _progress(queue.status(collected)):
         _scan_worklist(seeds, _NO_FUNC, collected, queue, processed_ranges, origins)
         _drain_functions(queue, collected, processed_ranges, origins)
     return collected
@@ -1264,7 +1282,7 @@ def collect_recursive_ranges_from_callers(ea, origins: dict | None = None) -> li
         origins = {}
     queue = _FuncQueue()
     collected = []
-    with _keep_partial(collected):
+    with _keep_partial(collected), _progress(queue.status(collected)):
         for start in get_caller_cluster(ea):
             queue.add_closure(start, origins)
         _drain_functions(queue, collected, _Coverage(), origins)
