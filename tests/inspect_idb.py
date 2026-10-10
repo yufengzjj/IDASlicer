@@ -39,6 +39,7 @@ def main(path, ranges):
         "is_64": ida_ida.inf_is_64bit(),
         "cc_id": ida_ida.inf_get_cc_id(),
         "imagebase": ida_nalt.get_imagebase(),
+        "input_file": ida_nalt.get_input_file_path(),
         "segments": [],
         "ranges": [],
         "names": {},

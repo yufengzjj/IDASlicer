@@ -58,6 +58,7 @@ def test_perform_slice(db, plugin, qt, worker_runs):
     # Offered next to the open database, which idalib names `<input>.i64`.
     out = inspect(db.path.with_name(db.path.name + "_slice.i64"), [(e.start, e.end) for e in entries])
     assert out["imagebase"] == ida_nalt.get_imagebase()
+    assert out["input_file"].endswith("elf_arm64"), "no program name keeps the template's"
     segs = {(s["start"], s["end"]): s for s in out["segments"]}
     for e, got in zip(entries, out["ranges"]):
         seg = segs[(e.start, e.end)]
@@ -123,11 +124,28 @@ def test_perform_slice_sends_the_compiler(db, plugin, qt, monkeypatch):
     monkeypatch.setattr(idaslicer, "_run_worker", run)
     leaf = db.ea("leaf")
     plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
-    ((_, cc_id, imagebase, source, _, analysis),) = sent
+    ((_, cc_id, imagebase, source, program_name, _, analysis),) = sent
     assert cc_id == ida_ida.inf_get_cc_id()
     assert imagebase == ida_nalt.get_imagebase()
     assert source == [ida_nalt.get_root_filename(), ida_nalt.retrieve_input_file_md5().hex()]
+    assert program_name == ""
     assert analysis is None
+
+
+def test_perform_slice_names_the_program(db, plugin, qt, worker_runs):
+    leaf = db.ea("leaf")
+    entry = idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)
+    plugin.perform_slice([entry], "elf_arm64", program_name=r" D:\elsewhere\my_prog.exe ")
+    assert qt.box.calls[-1][:2] == ("information", "Success"), qt.box.calls
+    out = db.path.with_name("my_prog.i64")
+    assert inspect(out)["input_file"] == "my_prog.exe"
+
+    # A name that would offer the open database offers a `_slice` beside it.
+    idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    name = os.path.basename(idb).removesuffix(".i64") + ".exe"
+    plugin.perform_slice([entry], "elf_arm64", program_name=name)
+    assert qt.box.calls[-1][:2] == ("information", "Success"), qt.box.calls
+    assert inspect(idb.removesuffix(".i64") + "_slice.i64")["input_file"] == name
 
 
 @pytest.fixture
@@ -197,7 +215,7 @@ def test_template_matches_its_name(template, tmp_path):
 
 def _run_worker(tmp_path, out, entries_data, cc_id=None, imagebase=None):
     data = tmp_path / "data.pickle"
-    data.write_bytes(pickle.dumps((str(out), cc_id, imagebase, None, entries_data, None)))
+    data.write_bytes(pickle.dumps((str(out), cc_id, imagebase, None, "", entries_data, None)))
     script = tmp_path / "worker.py"
     script.write_text(idaslicer.WORKER_SCRIPT)
     return subprocess.run([sys.executable, str(script), str(data)], capture_output=True, text=True, timeout=300, check=False)

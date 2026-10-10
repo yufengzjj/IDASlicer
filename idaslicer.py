@@ -104,7 +104,7 @@ def run_worker(data_path):
     problems = []
     try:
         with open(data_path, 'rb') as f:
-            out_path, cc_id, imagebase, source, entries_data, analysis = pickle.load(f)
+            out_path, cc_id, imagebase, source, program_name, entries_data, analysis = pickle.load(f)
 
         progress("Opening the template database")
         with ida_domain.Database.open(out_path) as db:
@@ -125,6 +125,8 @@ def run_worker(data_path):
                 node = ida_netnode.netnode("$ idaslicer source", 0, True)
                 node.supset(0, source[0])
                 node.supset(1, source[1])
+            if program_name:
+                ida_nalt.set_root_filename(program_name)
             name_counts = {}
             shown = 0.0
             for i, entry_data in enumerate(entries_data):
@@ -2005,6 +2007,10 @@ def _slicer_list_path() -> str | None:
     return os.path.splitext(idb)[0] + ".slicer.json" if idb else None
 
 
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
 # Events that can change what export_user_data() writes, apart from decompiler
 # edits: those made through the API (scripts) raise no event at all.
 _IDB_CHANGE_EVENTS = (
@@ -2572,6 +2578,13 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.type_edit = QtWidgets.QLineEdit()
         self.type_edit.setText(self.plugin.detect_file_type())
         type_layout.addWidget(self.type_edit)
+        type_layout.addWidget(QtWidgets.QLabel("Program name:"))
+        self.program_edit = QtWidgets.QLineEdit()
+        self.program_edit.setText(source_binary()[0])
+        self.program_edit.setToolTip(
+            "The input file name the slice records, and the default name of the slice database.\nLeave it empty to keep the template's."
+        )
+        type_layout.addWidget(self.program_edit)
         self.slice_button = QtWidgets.QPushButton("Slice and Create IDA Database")
         self.slice_button.clicked.connect(self.on_slice_clicked)
         type_layout.addWidget(self.slice_button)
@@ -2646,7 +2659,9 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
             QtWidgets.QMessageBox.warning(self.parent, "Error", "Please enter a file type.")
             return
 
-        self.plugin.perform_slice(self.table.entries, file_type_str, with_analysis=self.slice_analysis_check.isChecked())
+        self.plugin.perform_slice(
+            self.table.entries, file_type_str, with_analysis=self.slice_analysis_check.isChecked(), program_name=self.program_edit.text()
+        )
 
     def on_save_seg_clicked(self):
         self.plugin.save_segments_to_files(self.table.entries, merge=self.merge_check.isChecked())
@@ -3200,7 +3215,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         base_ftype = ftype_map.get(ftype_enum, "unknown")
         return f"{base_ftype}_{proc_name}"
 
-    def perform_slice(self, entries: list[SlicerEntry], file_type_str, with_analysis: bool = False):
+    def perform_slice(self, entries: list[SlicerEntry], file_type_str, with_analysis: bool = False, program_name: str = ""):
+        """`program_name` becomes the slice's input file name and names the offered
+        .i64; empty keeps the template's."""
         entries = _export_entries(entries)
         if not entries:
             print("No entries to slice.")
@@ -3214,18 +3231,22 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             QtWidgets.QMessageBox.warning(None, "Error", f"Template not found:\n{template_path}")
             return
 
+        program_name = os.path.basename(program_name.strip())
         idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
         default = os.path.splitext(idb)[0] + "_slice.i64"
+        if program_name:
+            named = os.path.join(os.path.dirname(idb), os.path.splitext(program_name)[0] + ".i64")
+            default = os.path.splitext(named)[0] + "_slice.i64" if _same_path(named, idb) else named
         out_path, _ = QtWidgets.QFileDialog.getSaveFileName(None, "Save slice", default, "IDA database (*.i64)")
         if not out_path:
             return
-        if os.path.normcase(os.path.abspath(out_path)) == os.path.normcase(os.path.abspath(idb)):
+        if _same_path(out_path, idb):
             QtWidgets.QMessageBox.warning(None, "Error", "Cannot save the slice over the open database.")
             return
 
         ida_kernwin.show_wait_box("Reading ranges...")
         try:
-            report = self._slice(entries, template_path, out_path, with_analysis)
+            report = self._slice(entries, template_path, out_path, with_analysis, program_name)
         finally:
             ida_kernwin.hide_wait_box()
         if report is None:
@@ -3235,7 +3256,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         print(f"[IDASlicer] {title}: {text}")
         getattr(QtWidgets.QMessageBox, kind)(None, title, text)
 
-    def _slice(self, entries: list[SlicerEntry], template_path: str, out_path: str, with_analysis: bool) -> tuple[str, str, str] | None:
+    def _slice(
+        self, entries: list[SlicerEntry], template_path: str, out_path: str, with_analysis: bool, program_name: str
+    ) -> tuple[str, str, str] | None:
         """The work of `perform_slice`, under its wait box. Returns what to report
         as (QMessageBox method, title, text), or None when the user cancelled."""
         entries_data = []
@@ -3285,7 +3308,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         try:
             with os.fdopen(data_fd, "wb") as f:
                 source = [name or "" for name in source_binary()]
-                pickle.dump((out_path, ida_ida.inf_get_cc_id(), ida_nalt.get_imagebase(), source, entries_data, analysis), f)
+                pickle.dump((out_path, ida_ida.inf_get_cc_id(), ida_nalt.get_imagebase(), source, program_name, entries_data, analysis), f)
 
             with os.fdopen(script_fd, "w") as f:
                 f.write(WORKER_SCRIPT)
