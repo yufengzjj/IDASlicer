@@ -17,6 +17,16 @@ def _entry(start, end, name="hand"):
     return idaslicer.SlicerEntry(name, start, end, seg.perm, seg.type, seg.align)
 
 
+def test_reload_of_a_broken_file_changes_nothing(plugin, tmp_path, monkeypatch, capsys):
+    broken = tmp_path / "idaslicer.py"
+    broken.write_text("def broken(:\n", encoding="utf-8")
+    monkeypatch.setattr(idaslicer, "__file__", str(broken))
+    monkeypatch.setattr(plugin, "term", lambda: (_ for _ in ()).throw(AssertionError("term() was called")))
+    plugin.reload()
+    assert "Not reloaded, nothing changed" in capsys.readouterr().out
+    assert type(plugin) is idaslicer.IDASlicerPlugin
+
+
 def test_recursive_add_merges_into_runs(db, plugin):
     origins = {}
     ranges = idaslicer.collect_recursive_ranges(db.ea("root"), origins)

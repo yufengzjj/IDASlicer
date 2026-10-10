@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 from collections.abc import Callable, Iterable
 from typing import NamedTuple
 
@@ -2619,6 +2620,10 @@ class SlicerPluginForm(ida_kernwin.PluginForm):
         self.settings_button = QtWidgets.QPushButton("Settings")
         self.settings_button.clicked.connect(self.on_settings_clicked)
         search_layout.addWidget(self.settings_button)
+        self.reload_button = QtWidgets.QPushButton("Reload")
+        self.reload_button.setToolTip("Load idaslicer.py again from disk, so that changes to it take effect without restarting IDA")
+        self.reload_button.clicked.connect(lambda: ida_kernwin.process_ui_action("idaslicer:reload"))
+        search_layout.addWidget(self.reload_button)
         self.layout.addLayout(search_layout)
 
         self.table = SlicerTable(self.plugin)
@@ -2790,6 +2795,22 @@ class AddToSlicerHandler(ida_kernwin.action_handler_t):
 
     def update(self, ctx):
         return ida_kernwin.AST_ENABLE_FOR_WIDGET if ctx.widget_type == ida_kernwin.BWN_DISASM else ida_kernwin.AST_DISABLE_FOR_WIDGET
+
+
+class ReloadHandler(ida_kernwin.action_handler_t):
+    def __init__(self, plugin):
+        ida_kernwin.action_handler_t.__init__(self)
+        self.plugin = plugin
+
+    def activate(self, ctx):
+        # Later, from Qt's event loop: the reload unregisters this action and
+        # closes the panel, which must not happen inside their own callbacks.
+        # Not from an IDA timer: unregister_timer() inside one hangs IDA.
+        QtCore.QTimer.singleShot(0, self.plugin.reload)
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
 
 
 # --- Main Plugin ---
@@ -3061,6 +3082,38 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 AddToSlicerHandler(self, "segment"),  # ty:ignore[too-many-positional-arguments]
             )
         )
+        ida_kernwin.register_action(
+            ida_kernwin.action_desc_t(
+                "idaslicer:reload",
+                "IDASlicer: reload the plugin from disk",
+                ReloadHandler(self),  # ty:ignore[too-many-positional-arguments]
+            )
+        )
+
+    def reload(self):
+        """Run idaslicer.py as it is on disk now in place of the loaded code, without restarting IDA."""
+        try:
+            with open(__file__, encoding="utf-8") as f:
+                code = compile(f.read(), __file__, "exec")
+        except (OSError, SyntaxError) as e:
+            print(f"[IDASlicer] Not reloaded, nothing changed: {e}")
+            return
+        reopen = self.form is not None
+        if reopen:
+            self.form.Close(0)
+        self.term()
+        try:
+            exec(code, globals())  # noqa: S102 -- the plugin's own file
+        except Exception:  # noqa: BLE001 -- the plugin must come back up
+            traceback.print_exc()
+            print("[IDASlicer] Reload failed part way; restart IDA to be sure of the loaded code.")
+        else:
+            # IDA keeps calling this instance, so it takes the new class.
+            self.__class__ = globals()["IDASlicerPlugin"]
+            print(f"[IDASlicer] Reloaded {__file__}")
+        self.init()
+        if reopen:
+            self.run(0)
 
     def unregister_actions(self):
         ida_kernwin.unregister_action("idaslicer:add_func")
@@ -3068,6 +3121,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
         ida_kernwin.unregister_action("idaslicer:add_callers_recursive")
         ida_kernwin.unregister_action("idaslicer:add_sel")
         ida_kernwin.unregister_action("idaslicer:add_seg")
+        ida_kernwin.unregister_action("idaslicer:reload")
 
     def add_to_list(self, *entries):
         """Add hand-picked entries. One that overlaps a listed entry is merged
