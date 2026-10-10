@@ -286,6 +286,20 @@ def test_import_qualified_type_names(db):
     assert idaslicer._type_blocks(idaslicer._export_types({"std::__1::ios"})) == idaslicer._type_blocks(types)
 
 
+def test_import_members_ida_cannot_parse(db):
+    """Swift metadata gives members keyword names and unsized arrays in the middle."""
+    name = _add_type("struct Tars::Config { bool __identifier(default); unsigned __int8 skip[0]; int after; };")
+    types = idaslicer._export_types({name})
+    (block,) = idaslicer._type_blocks(types)
+    assert "  bool default;" in block and "  unsigned __int8 skip[];" in block, block
+    assert ida_typeinf.parse_decl(ida_typeinf.tinfo_t(), None, block, ida_typeinf.PT_SIL) is None, "IDA's parser takes it now"
+    assert ida_typeinf.del_named_type(None, name, ida_typeinf.NTF_TYPE)
+    done, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "types": types})
+    assert problems == []
+    assert done["local type"] == 1
+    assert idaslicer._type_blocks(idaslicer._export_types({name})) == [block]
+
+
 def _json(data):
     return json.loads(json.dumps(data))
 

@@ -2,6 +2,7 @@ import bisect
 import collections
 import contextlib
 import copy
+import functools
 import hashlib
 import itertools
 import json
@@ -1418,6 +1419,8 @@ _AUTOSAVE_FILE = re.compile(r"\d{8}-\d{6}\.json")
 # print_decls() opens every type with a `/* <ordinal> */` line.
 _TYPE_BLOCK = re.compile(r"(?m)^/\* (\d+) \*/$")
 _FORWARD_DECL = re.compile(r"(?:struct|union|enum) [^{}]+;")
+# A member line of _export_types() output whose name ends the declarator: not a function pointer.
+_MEMBER = re.compile(r"(?m)^(?P<head>  \S.*?[\s*&])(?P<name>[A-Za-z_]\w*)(?P<dims>(?:\[\d*\])*)(?P<tail>(?: : \d+)?;.*)$")
 _AUTOSAVE_TICK_MS = 60_000
 _PROBLEMS_SHOWN = 20
 
@@ -1461,19 +1464,35 @@ def _parse_type(decl: str):
     return None
 
 
+@functools.cache
+def _reserved_word(name: str) -> bool:
+    return ida_typeinf.parse_decl(ida_typeinf.tinfo_t(), None, f"struct {_DECL_NAME} {{ int {name}; }};", ida_typeinf.PT_SIL) is None  # ty:ignore[missing-argument, invalid-argument-type]
+
+
+def _parseable_members(match: re.Match) -> str:
+    name, dims = match["name"], match["dims"].replace("[]", "[0]")
+    return f"{match['head']}{f'__identifier({name})' if _reserved_word(name) else name}{dims}{match['tail']}"
+
+
 def _store_decl(block: str) -> bool:
     """Add one local type with parse_decl(), which takes a qualified name such
-    as `Swift::Double` that parse_decls() rejects."""
+    as `Swift::Double` that parse_decls() rejects. True when stored as written."""
     til = ida_typeinf.get_idati()
     tif = ida_typeinf.tinfo_t()  # ty:ignore[missing-argument]
     name = ida_typeinf.parse_decl(tif, til, block, ida_typeinf.PT_SIL)
+    as_written = bool(name)
+    if not name:
+        # IDA's types allow what its parser does not: a member named like a
+        # keyword (`default`), taken as `__identifier(default)`, and an unsized
+        # array before the last member, which `[0]` gives as well.
+        name = ida_typeinf.parse_decl(tif, til, _MEMBER.sub(_parseable_members, block), ida_typeinf.PT_SIL)
     if not name:
         return False
     # parse_decl() does not mark a forward declaration as one, and storing it
     # would replace the type's definition.
     if _FORWARD_DECL.fullmatch(block) and ida_typeinf.get_type_ordinal(til, name):
         return True
-    return tif.set_named_type(til, name, ida_typeinf.NTF_REPLACE) == ida_typeinf.TERR_OK
+    return tif.set_named_type(til, name, ida_typeinf.NTF_REPLACE) == ida_typeinf.TERR_OK and as_written
 
 
 def _applied_type(ea: int) -> str:
@@ -1909,10 +1928,10 @@ def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int
     elif changed:
         failed = [b for b in changed if ida_typeinf.parse_decls(None, b, None, ida_typeinf.HTI_DCL) != 0 and not _store_decl(b)]  # ty:ignore[invalid-argument-type]
         done["local type"] += len(changed) - len(failed)
-        # IDA also prints `typedef ... wchar_t;`, a keyword to its parser, and
-        # anonymous members as types of their own named `Outer::$<hash>`. The
-        # other declarations can bring such a type in unchanged, and an anonymous
-        # member is whole inside the declaration of the type that holds it.
+        # What _store_decl() rewrote counts only if the type now prints as it did.
+        # IDA also prints `typedef ... wchar_t;`, a keyword to its parser, which
+        # the other declarations can bring in unchanged; and older exports print
+        # anonymous members inside the type that holds them as well as on their own.
         present = set(_type_blocks(_export_types())) if failed else set()
         for block in failed:
             head = block.splitlines()[0]
