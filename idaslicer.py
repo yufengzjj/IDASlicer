@@ -3214,11 +3214,14 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             QtWidgets.QMessageBox.warning(None, "Error", f"Template not found:\n{template_path}")
             return
 
-        input_path = ida_nalt.get_input_file_path()
-        out_dir = os.path.dirname(input_path)
-        base_name = os.path.basename(input_path)
-        out_name = os.path.splitext(base_name)[0] + "_slice.i64"
-        out_path = os.path.join(out_dir, out_name)
+        idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+        default = os.path.splitext(idb)[0] + "_slice.i64"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(None, "Save slice", default, "IDA database (*.i64)")
+        if not out_path:
+            return
+        if os.path.normcase(os.path.abspath(out_path)) == os.path.normcase(os.path.abspath(idb)):
+            QtWidgets.QMessageBox.warning(None, "Error", "Cannot save the slice over the open database.")
+            return
 
         ida_kernwin.show_wait_box("Reading ranges...")
         try:

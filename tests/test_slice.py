@@ -6,6 +6,7 @@ import sys
 
 import ida_bytes
 import ida_ida
+import ida_loader
 import ida_nalt
 import ida_segment
 import ida_typeinf
@@ -54,7 +55,8 @@ def test_perform_slice(db, plugin, qt, worker_runs):
     assert not [k for k in kw["env"] if k != "IDADIR" and ("IDA" in k.upper() or k in ("PYTHONPATH", "PYTHONHOME"))]
     assert not os.path.exists(argv[1]) and not os.path.exists(argv[2]), "temp files left behind"
 
-    out = inspect(db.path.with_name("scan_arm64_slice.i64"), [(e.start, e.end) for e in entries])
+    # Offered next to the open database, which idalib names `<input>.i64`.
+    out = inspect(db.path.with_name(db.path.name + "_slice.i64"), [(e.start, e.end) for e in entries])
     assert out["imagebase"] == ida_nalt.get_imagebase()
     segs = {(s["start"], s["end"]): s for s in out["segments"]}
     for e, got in zip(entries, out["ranges"]):
@@ -91,6 +93,23 @@ def test_perform_slice_without_template(db, plugin, qt, worker_runs):
     assert qt.box.calls[-1][:2] == ("warning", "Error")
     assert "Template not found" in qt.box.calls[-1][2]
     assert not worker_runs
+
+
+def test_perform_slice_save_dialog_cancelled(db, plugin, qt, worker_runs, no_slice):
+    qt.files.files = [""]
+    leaf = db.ea("leaf")
+    plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
+    assert not worker_runs and not qt.box.calls
+    assert not no_slice.exists()
+
+
+def test_perform_slice_refuses_the_open_database(db, plugin, qt, worker_runs):
+    idb = ida_loader.get_path(ida_loader.PATH_TYPE_IDB)
+    qt.files.files = [idb.replace("\\", "/")]
+    leaf = db.ea("leaf")
+    plugin.perform_slice([idaslicer.SlicerEntry("a", leaf, leaf + 4, 5, ida_segment.SEG_CODE, 0)], "elf_arm64")
+    assert qt.box.calls[-1][:2] == ("warning", "Error")
+    assert not worker_runs and not os.path.exists(idb)
 
 
 def test_perform_slice_sends_the_compiler(db, plugin, qt, monkeypatch):
@@ -132,7 +151,7 @@ def test_perform_slice_shows_progress(db, plugin, qt, worker_runs, wait_box):
 @pytest.fixture
 def no_slice(db):
     """The slice's output path, with what earlier tests wrote there removed."""
-    out = db.path.with_name("scan_arm64_slice.i64")
+    out = db.path.with_name(db.path.name + "_slice.i64")
     for p in out.parent.glob(out.stem + ".*"):
         p.unlink()
     return out

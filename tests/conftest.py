@@ -111,8 +111,9 @@ class FakeFileDialog:
         return (cls.files[0] if cls.files else ""), ""
 
     @classmethod
-    def getSaveFileName(cls, *a):
-        return cls.getOpenFileName()
+    def getSaveFileName(cls, parent, caption, default, *a):
+        """With no `files`, the user takes the offered path; `[""]` cancels."""
+        return (cls.files[0] if cls.files else default), ""
 
 
 qt_stub.install({"QMessageBox": FakeMessageBox, "QCheckBox": FakeCheckBox, "QFileDialog": FakeFileDialog})

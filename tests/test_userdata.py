@@ -275,12 +275,13 @@ def test_slice_with_user_analysis(edits, db, plugin, qt, tmp_path):
     plugin._add_collected_ranges(idaslicer.collect_recursive_ranges(db.ea("root"), origins), origins)
     ranges = idaslicer._merge_intervals((e.start, e.end) for e in plugin.entries)
     before = _json(idaslicer.export_user_data(ranges=ranges))
+    sliced = tmp_path / "slice.i64"
+    qt.files.files = [str(sliced)]
     plugin.perform_slice(plugin.entries, plugin.detect_file_type(), with_analysis=True)
     kind, title, text = qt.box.calls[-1]
     assert (kind, title) == ("information", "Success"), qt.box.calls
     assert "User analysis applied:" in text and "could not be applied" not in text, text
 
-    sliced = db.path.with_name(db.path.stem + "_slice.i64")
     after = userdata_child.run(sliced, tmp_path / "out.json")["export"]
     for key in ("functions", "names", "applied_types", "func_comments", "bookmarks", "decompiler"):
         assert after[key] == before[key], key
@@ -309,9 +310,10 @@ def test_edits_made_in_a_slice_go_back_to_the_source(edits, db, plugin, qt, tmp_
     before = idaslicer.export_user_data()
     origins = {}
     plugin._add_collected_ranges(idaslicer.collect_recursive_ranges(db.ea("root"), origins), origins)
+    sliced = tmp_path / "slice.i64"
+    qt.files.files = [str(sliced)]
     plugin.perform_slice(plugin.entries, plugin.detect_file_type())
     assert qt.box.calls[-1][:2] == ("information", "Success"), qt.box.calls
-    sliced = db.path.with_name(db.path.stem + "_slice.i64")
     funcs = [f for f in idautils.Functions() if any(e.start <= f < e.end for e in plugin.entries)]
     callee, via, fill = db.ea("callee_a"), db.ea("via_ptr2"), db.ea("fill_bss")
     assert {callee, via, fill} <= set(funcs)
