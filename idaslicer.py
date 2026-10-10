@@ -1416,7 +1416,8 @@ _DECL_NAME = "__idaslicer_t"
 _FUNC_PTR_DECL = re.compile(rf"\(([^()*]*)\*{_DECL_NAME}\)")
 _AUTOSAVE_FILE = re.compile(r"\d{8}-\d{6}\.json")
 # print_decls() opens every type with a `/* <ordinal> */` line.
-_TYPE_BLOCK = re.compile(r"(?m)^/\* \d+ \*/$")
+_TYPE_BLOCK = re.compile(r"(?m)^/\* (\d+) \*/$")
+_FORWARD_DECL = re.compile(r"(?:struct|union|enum) [^{}]+;")
 _AUTOSAVE_TICK_MS = 60_000
 _PROBLEMS_SHOWN = 20
 
@@ -1442,8 +1443,10 @@ def _hr_items(kind: str, m):
         it = nxt(it)
 
 
+# Without NOREGEX, IDA prints C++ names shortened by its regexes
+# (`std::__1::basic_string<char>` as `std::string`), which name other types or none.
 def _type_decl(tif) -> str:
-    return tif._print(_DECL_NAME, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_SEMI)
+    return tif._print(_DECL_NAME, ida_typeinf.PRTYPE_1LINE | ida_typeinf.PRTYPE_SEMI | ida_typeinf.PRTYPE_NOREGEX)
 
 
 def _parse_type(decl: str):
@@ -1456,6 +1459,21 @@ def _parse_type(decl: str):
         if ptr.create_ptr(tif):
             return ptr
     return None
+
+
+def _store_decl(block: str) -> bool:
+    """Add one local type with parse_decl(), which takes a qualified name such
+    as `Swift::Double` that parse_decls() rejects."""
+    til = ida_typeinf.get_idati()
+    tif = ida_typeinf.tinfo_t()  # ty:ignore[missing-argument]
+    name = ida_typeinf.parse_decl(tif, til, block, ida_typeinf.PT_SIL)
+    if not name:
+        return False
+    # parse_decl() does not mark a forward declaration as one, and storing it
+    # would replace the type's definition.
+    if _FORWARD_DECL.fullmatch(block) and ida_typeinf.get_type_ordinal(til, name):
+        return True
+    return tif.set_named_type(til, name, ida_typeinf.NTF_REPLACE) == ida_typeinf.TERR_OK
 
 
 def _applied_type(ea: int) -> str:
@@ -1506,9 +1524,25 @@ def _export_types(names: set[str] | None = None) -> list[str]:
         ordinals = sorted({o for o in (ida_typeinf.get_type_ordinal(til, n) for n in names) if o})
     if not ordinals:
         return []
+    # print_decls() picks the dependencies, their order and the forward
+    # declarations, but shortens C++ names in definitions, so each type is
+    # printed again by itself; anonymous members then appear by name, and
+    # print_decls() lists their types too.
     sink = _TextSink()  # ty:ignore[missing-argument]
     ida_typeinf.print_decls(sink, til, ordinals, ida_typeinf.PDF_INCL_DEPS | ida_typeinf.PDF_DEF_FWD)
-    return "".join(sink.parts).splitlines()
+    forward, *parts = _TYPE_BLOCK.split("".join(sink.parts))
+    lines = []
+    # One block each, so that an import can take them one by one.
+    for decl in forward.split("\n"):
+        if decl.strip():
+            lines += [f"/* {ida_typeinf.get_type_ordinal(til, decl.split(' ', 1)[1].rstrip(';'))} */", decl]
+    flags = ida_typeinf.PRTYPE_DEF | ida_typeinf.PRTYPE_MULTI | ida_typeinf.PRTYPE_TYPE | ida_typeinf.PRTYPE_SEMI
+    flags |= ida_typeinf.PRTYPE_PRAGMA | ida_typeinf.PRTYPE_NOREGEX
+    for ordinal in map(int, parts[::2]):
+        tif = ida_typeinf.tinfo_t()  # ty:ignore[missing-argument]
+        tif.get_numbered_type(til, ordinal)
+        lines += [f"/* {ordinal} */", *tif._print(ida_typeinf.get_numbered_type_name(til, ordinal), flags, 2).splitlines()]
+    return lines
 
 
 def _named_types(tif, out: set[str]):
@@ -1549,8 +1583,8 @@ def _referenced_types(out: dict) -> set[str]:
 
 
 def _type_blocks(lines: list[str]) -> list[str]:
-    """The declarations in print_decls() output, without their ordinal lines."""
-    return [b.strip() for b in _TYPE_BLOCK.split("\n".join(lines)) if b.strip()]
+    """The declarations in _export_types() output, without their ordinal lines."""
+    return [b.strip() for b in _TYPE_BLOCK.split("\n".join(lines))[::2] if b.strip()]
 
 
 def _in_ranges(ea: int, ranges: list[tuple[int, int]]) -> bool:
@@ -1873,7 +1907,7 @@ def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int
     if changed and ida_typeinf.parse_decls(None, "\n".join(changed), None, ida_typeinf.HTI_DCL) == 0:  # ty:ignore[invalid-argument-type]
         done["local type"] += len(changed)
     elif changed:
-        failed = [b for b in changed if ida_typeinf.parse_decls(None, b, None, ida_typeinf.HTI_DCL) != 0]  # ty:ignore[invalid-argument-type]
+        failed = [b for b in changed if ida_typeinf.parse_decls(None, b, None, ida_typeinf.HTI_DCL) != 0 and not _store_decl(b)]  # ty:ignore[invalid-argument-type]
         done["local type"] += len(changed) - len(failed)
         # IDA also prints `typedef ... wchar_t;`, a keyword to its parser, and
         # anonymous members as types of their own named `Outer::$<hash>`. The

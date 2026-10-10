@@ -202,7 +202,9 @@ def test_import_restores_every_edit(edits, all_types):
     assert problems == []
     assert done["name"] == len(before["names"])
     # Node, and with only referenced types also the forward declarations they open with.
-    assert done["local type"] == (1 if all_types else 2)
+    forward = [b for b in idaslicer._type_blocks(before["types"]) if idaslicer._FORWARD_DECL.fullmatch(b)]
+    assert all_types or forward
+    assert done["local type"] == (1 if all_types else 1 + len(forward))
     assert idaslicer.export_user_data(all_types) == before
     assert "count" in _lvar_names(edits["root"])
 
@@ -249,6 +251,39 @@ def test_import_types_ida_cannot_parse(db):
     assert problems == []
     assert done["local type"] == 3
     assert idaslicer._type_blocks(idaslicer._export_types({"SliceOuter"})) == idaslicer._type_blocks(types)
+
+
+def _add_type(decl):
+    """parse_decls() rejects a qualified name; parse_decl() takes it."""
+    tif = ida_typeinf.tinfo_t()
+    name = ida_typeinf.parse_decl(tif, None, decl, ida_typeinf.PT_SIL)
+    assert name, decl
+    assert tif.set_named_type(None, name, ida_typeinf.NTF_REPLACE) == ida_typeinf.TERR_OK
+    return name
+
+
+def test_import_qualified_type_names(db):
+    names = [
+        _add_type("typedef double Swift::Double;"),
+        _add_type("struct std::__1::basic_string<char> { char *p; Swift::Double d; };"),
+        _add_type("struct std::__1::ios_vtbl;"),
+        _add_type("struct std::__1::ios { std::__1::ios_vtbl *vt; std::__1::basic_string<char> s; };"),
+        _add_type("struct std::__1::ios_vtbl { void (__fastcall *f)(std::__1::ios *self); };"),
+    ]
+    sink = idaslicer._TextSink()
+    ida_typeinf.print_decls(sink, None, [ida_typeinf.get_type_ordinal(None, "std::__1::ios")], ida_typeinf.PDF_INCL_DEPS)
+    assert "struct std::string" in "".join(sink.parts), "IDA no longer shortens C++ names"
+
+    types = idaslicer._export_types({"std::__1::ios"})
+    assert {b.splitlines()[0] for b in idaslicer._type_blocks(types)} >= {"struct std::__1::basic_string<char>", "struct std::__1::ios_vtbl;"}
+    ptr = idaslicer._parse_type("std::__1::basic_string<char> *__idaslicer_t;")
+    assert idaslicer._type_decl(ptr) == "std::__1::basic_string<char> *__idaslicer_t;"
+    for name in reversed(names[2:] + names[:2]):
+        if ida_typeinf.get_type_ordinal(None, name):
+            assert ida_typeinf.del_named_type(None, name, ida_typeinf.NTF_TYPE)
+    _, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "types": types})
+    assert problems == []
+    assert idaslicer._type_blocks(idaslicer._export_types({"std::__1::ios"})) == idaslicer._type_blocks(types)
 
 
 def _json(data):
