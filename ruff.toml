@@ -1,0 +1,4 @@
+# Older ruff selects far fewer rules by default and would pass code this one rejects.
+required-version = ">=0.17"
+target-version = "py312"
+line-length = 150

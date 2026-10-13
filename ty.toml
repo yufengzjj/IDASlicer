@@ -1,0 +1,14 @@
+[environment]
+python-version = "3.12"
+python = ".venv"
+
+# IDA's stubs return `T | None` from getseg/get_func and the like; a test that gets None
+# should fail on the spot, so checking for None there only adds noise. The stubs also
+# list required arguments that IDA does not need (`insn_t()`).
+[[overrides]]
+include = ["tests/**"]
+
+[overrides.rules]
+unresolved-attribute = "ignore"
+invalid-argument-type = "ignore"
+missing-argument = "ignore"

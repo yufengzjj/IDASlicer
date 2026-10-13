@@ -18,7 +18,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterable
-from typing import NamedTuple
+from typing import NamedTuple, TypedDict
 
 import ida_auto
 import ida_bytes
@@ -214,7 +214,7 @@ SOURCE_NODE = "$ idaslicer source"
 def source_binary() -> tuple[str, str | None]:
     """Name and MD5 (hex) of the binary this database's analysis belongs to: the
     one a slice was cut from, else the database's own input file."""
-    node = ida_netnode.netnode(SOURCE_NODE, 0, False)
+    node = ida_netnode.netnode(SOURCE_NODE, 0, False)  # ty:ignore[too-many-positional-arguments]
     if node.index() != ida_netnode.BADNODE:
         return node.supstr(0) or "", node.supstr(1) or None
     md5 = ida_nalt.retrieve_input_file_md5()
@@ -279,7 +279,7 @@ def _merge_entries(entries: list, touching: bool = True) -> list:
     Entries that only touch at a segment start stay apart: the second segment
     usually differs in permissions or type, and merging would give it the
     first one's."""
-    by_start = {}
+    by_start: dict[int, SlicerEntry] = {}
     for e in entries:
         by_start.setdefault(e.start, e)
     merged = []
@@ -591,14 +591,22 @@ def _read_range(ea: int, size: int) -> tuple[bytes | None, list[tuple[int, int]]
 # free functions that never receives the plugin instance -- threading these
 # through collect_recursive_ranges -> _drain_functions -> _scan_worklist ->
 # check_* would touch a dozen signatures to deliver two values.
-DEFAULT_SETTINGS = {
+class Settings(TypedDict):
+    max_explore_len: int
+    skip_named_data: bool
+    autosave_minutes: int
+    autosave_keep: int
+    export_all_types: bool
+
+
+DEFAULT_SETTINGS: Settings = {
     "max_explore_len": 128,
     "skip_named_data": False,
     "autosave_minutes": 0,
     "autosave_keep": 10,
     "export_all_types": False,
 }
-SETTINGS = dict(DEFAULT_SETTINGS)
+SETTINGS = DEFAULT_SETTINGS.copy()
 
 
 def _apply_stored_settings(stored):
@@ -714,9 +722,8 @@ def reconstruct_func_range(start_ea) -> list[tuple[int, int]]:
         # Follow jump targets that stay within this procedure. Skip calls and
         # jumps that land on the start of another defined function (tail calls).
         for xref in idautils.XrefsFrom(ea, 0):
-            if xref.type in (ida_xref.fl_JN, ida_xref.fl_JF):
-                if not _is_other_func_start(xref.to):
-                    stack.append(xref.to)
+            if xref.type in (ida_xref.fl_JN, ida_xref.fl_JF) and not _is_other_func_start(xref.to):
+                stack.append(xref.to)
 
         # IDA marks the next instruction as reached by flow only when this one
         # can fall through: not after RET, an unconditional or indirect jump, or
@@ -1073,17 +1080,18 @@ def _data_pointers(start: int, end: int, ptr_size: int) -> dict[int, int]:
             break
         if not (ida_bytes.is_code(flags) or ida_bytes.is_strlit(flags)):
             data, runs = _read_range(ea, item_end - ea)
-            seg = ida_segment.getseg(ea)
-            if seg is not None and seg.start_ea not in fixups_required:
-                fixups_required[seg.start_ea] = pe_relocated or _segment_has_fixups(seg)
-            need_fixup = seg is not None and fixups_required[seg.start_ea]
-            for off, n in runs:
-                lo, hi = ea + off, ea + off + n
-                first = lo if hi - lo == ptr_size == item_end - ea else (lo + ptr_size - 1) // ptr_size * ptr_size
-                for slot in range(first, hi - ptr_size + 1, ptr_size):
-                    if need_fixup and not ida_fixup.exists_fixup(slot):
-                        continue
-                    found.setdefault(int.from_bytes(data[slot - ea : slot - ea + ptr_size], byteorder), slot)
+            if data:
+                seg = ida_segment.getseg(ea)
+                if seg is not None and seg.start_ea not in fixups_required:
+                    fixups_required[seg.start_ea] = pe_relocated or _segment_has_fixups(seg)
+                need_fixup = seg is not None and fixups_required[seg.start_ea]
+                for off, n in runs:
+                    lo, hi = ea + off, ea + off + n
+                    first = lo if hi - lo == ptr_size == item_end - ea else (lo + ptr_size - 1) // ptr_size * ptr_size
+                    for slot in range(first, hi - ptr_size + 1, ptr_size):
+                        if need_fixup and not ida_fixup.exists_fixup(slot):
+                            continue
+                        found.setdefault(int.from_bytes(data[slot - ea : slot - ea + ptr_size], byteorder), slot)
             if runs and not ida_bytes.is_unknown(flags):
                 for a in [ea, *range((ea + 4) // 4 * 4, item_end, 4)]:
                     for x in idautils.XrefsFrom(a, ida_xref.XREF_DATA):
@@ -2419,7 +2427,7 @@ class SlicerTable(QtWidgets.QTableWidget):
             if existing is not None:
                 ida_funcs.del_func(existing.start_ea)
             ida_bytes.del_items(start, ida_bytes.DELIT_SIMPLE, size)
-            if not ida_funcs.add_func(start, end):
+            if not ida_funcs.add_func(start, end):  # ty:ignore[too-many-positional-arguments]
                 # Fall back to letting IDA pick the end if explicit bounds fail.
                 ida_funcs.add_func(start)
         ida_kernwin.request_refresh(ida_kernwin.IWID_DISASMS)
@@ -2620,7 +2628,7 @@ class SettingsDialog(QtWidgets.QDialog):
         self.keep_spin.setValue(DEFAULT_SETTINGS["autosave_keep"])
         self.all_types_check.setChecked(DEFAULT_SETTINGS["export_all_types"])
 
-    def values(self):
+    def values(self) -> Settings:
         return {
             "max_explore_len": self.explore_spin.value(),
             "skip_named_data": self.skip_named_check.isChecked(),
@@ -3117,7 +3125,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             ida_kernwin.action_desc_t(
                 "idaslicer:reload",
                 "IDASlicer: reload the plugin from disk",
-                ReloadHandler(self),  # ty:ignore[too-many-positional-arguments]
+                ReloadHandler(self),  # ty:ignore[too-many-positional-arguments, missing-argument]
             )
         )
 
@@ -3183,9 +3191,9 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             return
         ida_segment.set_segm_addressing(s, _default_bitness() if bitness is None else bitness)
         if seg_type is not None:
-            s.type = seg_type  # ty:ignore[invalid-assignment]
+            s.type = seg_type
         if align is not None:
-            s.align = align  # ty:ignore[invalid-assignment]
+            s.align = align
         s.update()
 
     @staticmethod
@@ -3269,7 +3277,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             ranges = collect(origins)
         except ScanCancelled as e:
             ranges, cancelled = e.ranges, True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- shown to the user below
             ranges, error = [], e
         finally:
             ida_kernwin.hide_wait_box()
@@ -3468,7 +3476,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
 
             ida_kernwin.replace_wait_box("Creating the slice database...")
             returncode, output = _run_worker([_worker_python(), script_path, data_path], env)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 -- shown to the user
             return "critical", "Error", f"Error during subprocess orchestration:\n{e}"
         finally:
             if os.path.exists(data_path):
@@ -3577,7 +3585,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             try:
                 with open(file_path, "wb") as f:
                     pickle.dump(merged, f)
-            except Exception as e:
+            except OSError as e:
                 print(f"Failed to write merged file {file_path}: {e}")
                 QtWidgets.QMessageBox.critical(None, "Error", f"Failed to write merged file:\n{e}")
                 return
@@ -3596,7 +3604,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 with open(file_path, "wb") as f:
                     pickle.dump(payload, f)
                 count += 1
-            except Exception as e:
+            except OSError as e:
                 print(f"Failed to write file {file_path}: {e}")
 
         QtWidgets.QMessageBox.information(None, "Success", f"Successfully saved {count} segment files to:\n{out_dir}")
@@ -3869,7 +3877,7 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
                 try:
                     with open(file_path, "rb") as f:
                         data = _SegUnpickler(f).load()
-                except Exception as e:
+                except Exception as e:  # noqa: BLE001 -- a damaged or crafted file can fail in any way
                     stats["unreadable"] += 1
                     results.append(f"Failed to read {filename}: {e}")
                     continue
