@@ -6,6 +6,7 @@ import types
 import ida_bytes
 import ida_fixup
 import ida_funcs
+import ida_name
 import ida_offset
 import ida_segment
 import ida_ua
@@ -186,6 +187,22 @@ def test_loose_data_with_values_keeps_cap(db):
     try:
         assert idaslicer.get_loose_data_range(ea, 2).end_ea == ea + 2
     finally:
+        assert ida_bytes.create_data(ea, kind, size, idaslicer.idaapi.BADADDR)
+
+
+def test_loose_data_passes_stale_dummy_name(db):
+    ea = db.ea("g_counter")
+    size, kind = ida_bytes.get_item_size(ea), ida_bytes.get_flags(ea) & ida_bytes.DT_TYPE
+    assert ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+    # Deleting the last xref clears the dummy name of an unexplored byte, but
+    # not always that of a defined item; set one the way such an item keeps it.
+    ida_name.set_dummy_name(db.ea("split_leaf"), ea + 2)
+    flags = ida_bytes.get_flags(ea + 2)
+    try:
+        assert ida_bytes.has_dummy_name(flags) and not ida_bytes.has_xref(flags)
+        assert idaslicer.get_loose_data_range(ea, size).end_ea == ea + size
+    finally:
+        assert ida_name.set_name(ea + 2, "")
         assert ida_bytes.create_data(ea, kind, size, idaslicer.idaapi.BADADDR)
 
 

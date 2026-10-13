@@ -631,15 +631,20 @@ def _apply_stored_settings(stored):
             SETTINGS[key] = val
 
 
+def _marks_object(flags) -> bool:
+    # Not has_any_name: IDA keeps a dummy name after its last xref is gone, and
+    # such a name says nothing about where an object starts.
+    return ida_bytes.has_name(flags) or ida_bytes.has_xref(flags)
+
+
 def _ends_unexplored_run(flags) -> bool:
-    # A referenced byte carries a dummy name, which ends the walk.
-    return not ida_bytes.is_unknown(flags) or ida_bytes.has_any_name(flags) or ida_bytes.has_xref(flags)
+    return not ida_bytes.is_unknown(flags) or _marks_object(flags)
 
 
 def get_loose_data_range(ea, max_explore_len=0):
-    """The data from `ea` up to the next name, code, or segment end, item by
-    item: without type information, the next referenced address (IDA names
-    every one) is the best guess at where the object ends. Capped at
+    """The data from `ea` up to the next referenced address, real name, code,
+    or segment end, item by item: without type information, the next
+    referenced address is the best guess at where the object ends. Capped at
     `max_explore_len` bytes, except where `ea` has no value (BSS): such a range
     costs nothing to carry, and cutting it short would leave the object
     partly outside the slice."""
@@ -651,7 +656,7 @@ def get_loose_data_range(ea, max_explore_len=0):
         if end_ea == idaapi.BADADDR or end_ea >= seg_end or not ida_bytes.is_mapped(end_ea):
             break
         flags = ida_bytes.get_flags(end_ea)
-        if end_ea != ea and (ida_name.get_name(end_ea) or ida_bytes.is_code(flags)):
+        if end_ea != ea and (_marks_object(flags) or ida_bytes.is_code(flags)):
             break
         if not capped and ida_bytes.is_unknown(flags):
             # One search instead of a step per byte: every unexplored byte is an
