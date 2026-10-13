@@ -1416,6 +1416,7 @@ _DECL_NAME = "__idaslicer_t"
 # IDA prints a pointer to a noreturn function as `void (__cdecl __noreturn *p)(...)`,
 # which its parser rejects; it does take the function `void __cdecl __noreturn p(...)`.
 _FUNC_PTR_DECL = re.compile(rf"\(([^()*]*)\*{_DECL_NAME}\)")
+_PARAM_NAME = re.compile(r"(?<=[\s*&])[A-Za-z_]\w*(?=@<|[,)\[])")
 _AUTOSAVE_FILE = re.compile(r"\d{8}-\d{6}\.json")
 # print_decls() opens every type with a `/* <ordinal> */` line.
 _TYPE_BLOCK = re.compile(r"(?m)^/\* (\d+) \*/$")
@@ -1462,7 +1463,28 @@ def _parse_type(decl: str):
         ptr = ida_typeinf.tinfo_t()
         if ptr.create_ptr(tif):
             return ptr
-    return None
+    return _parse_shared_param_names(decl)
+
+
+def _parse_shared_param_names(decl: str):
+    # IDA keeps a function type whose parameters share a name, but its parser rejects it.
+    seen, renamed = set(), {}
+
+    def rename(m):
+        if m[0] not in seen:
+            seen.add(m[0])
+            return m[0]
+        # IDA drops the leading underscores of a parameter name.
+        renamed[new := f"idaslicer_param{len(renamed)}"] = m[0]
+        return new
+
+    text = _PARAM_NAME.sub(rename, decl)
+    tif, details = ida_typeinf.tinfo_t(), ida_typeinf.func_type_data_t()  # ty:ignore[missing-argument]
+    if not renamed or ida_typeinf.parse_decl(tif, None, text, ida_typeinf.PT_SIL) is None or not tif.get_func_details(details):  # ty:ignore[invalid-argument-type]
+        return None
+    for arg in details:
+        arg.name = renamed.get(arg.name, arg.name)
+    return tif if tif.create_func(details) else None
 
 
 @functools.cache
@@ -1640,7 +1662,12 @@ def _export_heads(out: dict, ranges: list[tuple[int, int]]):
                 names[ea] = [ea, ida_name.get_ea_name(ea, ida_name.GN_LOCAL), not ida_name.get_ea_name(ea, 0)]
             # Functions, data, and call instructions given a call type.
             if ida_nalt.is_userti(ea):
-                out["applied_types"].append([ea, _applied_type(ea)])
+                decl = _applied_type(ea)
+                if _parse_type(decl) is not None:
+                    out["applied_types"].append([ea, decl])
+                else:
+                    # E.g. an unnamed custom calling convention, printed as `callcnv_200`.
+                    out["not_exported"].append(f"{hex(ea)}: type {decl}, which IDA cannot parse back")
     # Names on bytes that are not item heads, e.g. unexplored ones.
     for ea, name in idautils.Names():
         if ea not in names and _in_ranges(ea, ranges) and ida_bytes.has_user_name(ida_bytes.get_flags(ea)):
@@ -1946,6 +1973,10 @@ def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int
         ida_auto.auto_wait()
     for start, end in data.get("functions", []):
         start, end = start + delta, end + delta
+        # No function starts inside another's entry chunk in the exported database,
+        # so one here is analysis that was undone there, e.g. after a branch taken for a call.
+        while (inner := ida_funcs.get_next_func(start)) is not None and inner.start_ea < end and ida_funcs.del_func(inner.start_ea):
+            pass
         pfn = ida_funcs.get_func(start)
         if pfn is None or pfn.start_ea != start:
             check(ida_funcs.add_func(start, end), "function", f"cannot create {hex(start)}-{hex(end)}")  # ty:ignore[too-many-positional-arguments]
@@ -3456,12 +3487,15 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
             reports = [json.loads(line.removeprefix(WORKER_ANALYSIS)) for line in output.splitlines() if line.startswith(WORKER_ANALYSIS)]
             done, failed = (reports[-1]["done"], reports[-1]["problems"]) if reports else ({}, ["the worker did not report on it"])
             lines = ["User analysis applied:"] + [f"  {kind}: {n}" for kind, n in sorted(done.items())]
-            print("[IDASlicer] " + "\n".join(lines + failed))
-            if failed:
-                shown = failed[:_PROBLEMS_SHOWN]
-                lines += [f"{len(failed)} item(s) could not be applied (all are listed in the Output window):", *shown]
-                if len(failed) > len(shown):
-                    lines.append("...")
+            skipped = analysis[1]["not_exported"] if analysis else []
+            printed = lines + failed + (["Not exported:", *skipped] if skipped else [])
+            print("[IDASlicer] " + "\n".join(printed))
+            for items, title in ((failed, "could not be applied"), (skipped, "were not exported")):
+                if items:
+                    shown = items[:_PROBLEMS_SHOWN]
+                    lines += [f"{len(items)} item(s) {title} (all are listed in the Output window):", *shown]
+                    if len(items) > len(shown):
+                        lines.append("...")
             analysis_report = "\n\n" + "\n".join(lines)
         if problems:
             detail = "\n".join(problems)

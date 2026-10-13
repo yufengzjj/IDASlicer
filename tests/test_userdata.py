@@ -300,6 +300,46 @@ def test_import_members_ida_cannot_parse(db):
     assert idaslicer._type_blocks(idaslicer._export_types({name})) == [block]
 
 
+def test_import_type_with_shared_param_names(db):
+    decl = "__int64 __usercall __idaslicer_t@<X0>(_QWORD *p@<X0>, _QWORD *p@<X1>, _QWORD *out@<X8>);"
+    assert ida_typeinf.parse_decl(ida_typeinf.tinfo_t(), None, decl, ida_typeinf.PT_SIL) is None, "IDA's parser takes it now"
+    ea = db.ea("uncalled")
+    done, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "applied_types": [[ea, decl]]})
+    assert problems == []
+    assert done["type at address"] == 1
+    assert idaslicer._applied_type(ea) == decl
+    ida_nalt.del_tinfo(ea)
+
+
+def test_export_leaves_out_a_type_ida_cannot_parse(db):
+    details = ida_typeinf.func_type_data_t()
+    details.rettype = ida_typeinf.tinfo_t(ida_typeinf.BT_INT)
+    details.set_cc(ida_typeinf.CM_CC_FIRST_PLAIN_CUSTOM)
+    tif = ida_typeinf.tinfo_t()
+    assert tif.create_func(details)
+    ea = db.ea("via_ptr2")
+    assert ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE)
+    decl = idaslicer._applied_type(ea)
+    assert "callcnv_200" in decl, "IDA names this calling convention now"
+    data = idaslicer.export_user_data(ranges=[(ea, ea + 4)])
+    assert data["applied_types"] == []
+    assert data["not_exported"] == [f"{hex(ea)}: type {decl}, which IDA cannot parse back"]
+    ida_nalt.del_tinfo(ea)
+
+
+def test_import_removes_a_function_inside_another(db):
+    """Analysis starts a function at a branch it takes for a call; the exported database has none there."""
+    start = db.ea("fill_bss")
+    end = ida_funcs.get_func(start).end_ea
+    mid = start + 8
+    assert ida_funcs.set_func_end(start, mid) and ida_funcs.add_func(mid, end)
+    done, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "functions": [[start, end]]})
+    assert problems == []
+    assert done["function"] == 1
+    assert ida_funcs.get_func(mid).start_ea == start
+    assert ida_funcs.get_func(start).end_ea == end
+
+
 def _json(data):
     return json.loads(json.dumps(data))
 
