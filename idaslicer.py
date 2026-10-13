@@ -2868,6 +2868,8 @@ class IDASlicerPlugin(ida_idaapi.plugin_t):
     wanted_hotkey = ""
 
     def init(self):
+        global _PLUGIN
+        _PLUGIN = self
         self.form = None
         self.entries = []
         self.last_import_path = ""
@@ -3955,6 +3957,26 @@ class SlicerUIHooks(ida_kernwin.UI_Hooks):
         if title == FORM_TITLE:
             return self.plugin.create_form_widget()
         return None
+
+
+# The plugin instance IDA loaded, for add_ranges(); IDA keeps no reference other plugins can reach.
+_PLUGIN: IDASlicerPlugin | None = None
+
+
+def add_ranges(ranges: Iterable[tuple[int, int]], label: str) -> tuple[int, int] | None:
+    """For other plugins: fold `(start, end)` ranges into the slicer list the way a scan does
+    (ranges outside every segment are skipped), then save and refresh it. Returns
+    `(added, extended)`, or None when IDASlicer is not loaded."""
+    plugin = _PLUGIN
+    if plugin is None:
+        return None
+    ranges = list(ranges)
+    added, extended = plugin._add_collected_ranges(ranges, recursive=False)
+    plugin.save_entries()
+    if plugin.form:
+        plugin.form.table.refresh()
+    print(f"[IDASlicer] {label}: {len(ranges)} ranges given, {added} added / {extended} extended.")
+    return added, extended
 
 
 def PLUGIN_ENTRY():

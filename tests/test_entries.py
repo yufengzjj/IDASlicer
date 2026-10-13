@@ -1,6 +1,7 @@
 import json
 import os
 
+import ida_ida
 import ida_loader
 import ida_nalt
 import ida_segment
@@ -67,6 +68,18 @@ def test_runs_stay_apart_at_segment_start(db, plugin):
     bss = ida_segment.getseg(db.ea("g_bss")).start_ea
     plugin._add_collected_ranges([(db.ea("g_n1"), bss), (bss, bss + 16)])
     assert _rows(db, plugin.entries) == ["g_n1..g_bss", "g_bss..g_bss+0x10"]
+
+
+def test_add_ranges_for_other_plugins(db, plugin, tmp_path, monkeypatch):
+    leaf, callee, via = db.ea("leaf"), db.ea("callee_a"), db.ea("via_ptr")
+    monkeypatch.setattr(idaslicer, "_PLUGIN", None)
+    assert idaslicer.add_ranges([(leaf, callee)], "test") is None
+
+    monkeypatch.setattr(idaslicer, "_PLUGIN", plugin)
+    unmapped = ida_ida.inf_get_max_ea() + 0x1000
+    assert idaslicer.add_ranges([(leaf, callee), (callee, via), (unmapped, unmapped + 16)], "test") == (1, 0)
+    assert [(db.label(e.start), db.label(e.end), e.recursive) for e in plugin.entries] == [("leaf", "via_ptr", False)]
+    assert (tmp_path / "db.slicer.json").exists()
 
 
 def test_hand_adds_merge_only_overlaps(db, plugin):
