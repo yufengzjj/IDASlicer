@@ -1927,6 +1927,59 @@ def _within_ranges(data: dict, ranges: list[tuple[int, int]], delta: int) -> tup
     return out, skipped
 
 
+def _merge_segments(start: int, end: int) -> bool:
+    """Grow the segment at `start` over `[start, end)`: segments wholly inside are removed, one
+    reaching past `end` now starts there. False when there was nothing to merge."""
+    seg = ida_segment.getseg(start)
+    if seg is None or seg.end_ea >= end:
+        return False
+    first = seg.start_ea
+    later = []
+    nxt = ida_segment.get_next_seg(first)
+    while nxt is not None and nxt.start_ea < end:
+        later.append((nxt.start_ea, nxt.end_ea))
+        nxt = ida_segment.get_next_seg(nxt.start_ea)
+    # KEEP on every step: without it IDA drops the instructions, functions and names of the bytes
+    # that change segment, also past `end`.
+    keep = ida_segment.SEGMOD_KEEP | ida_segment.SEGMOD_SILENT
+    for s, e in later:
+        if e <= end:
+            ida_segment.del_segm(s, keep)
+        else:
+            ida_segment.set_segm_start(s, end, keep)
+    return ida_segment.set_segm_end(first, end, keep)
+
+
+def _clear_func_bounds(start: int, end: int) -> collections.Counter:
+    """Make room for the entry chunk `[start, end)` of the function at `start`: delete the functions
+    that start inside it, cut back the ones reaching into it from before, detach the tail chunks
+    that overlap it and merge the segments it spans (a function cannot cross a segment boundary).
+    Returns what it did, by kind."""
+    done = collections.Counter()
+    chunks = []  # (start, owner entry, is tail); func_t pointers do not survive the edits below
+    chunk = ida_funcs.get_fchunk(start) or ida_funcs.get_next_fchunk(start)
+    while chunk is not None and chunk.start_ea < end:
+        tail = bool(chunk.flags & ida_funcs.FUNC_TAIL)
+        chunks.append((chunk.start_ea, chunk.owner if tail else chunk.start_ea, tail))
+        chunk = ida_funcs.get_next_fchunk(chunk.start_ea)
+    # No function starts inside another's entry chunk in the exported database, so one here is
+    # analysis that was undone there, e.g. after a branch taken for a call.
+    deleted = {owner for _, owner, tail in chunks if not tail and owner > start}
+    for owner in sorted(deleted):
+        if ida_funcs.del_func(owner):
+            done["function inside deleted"] += 1
+    for chunk_start, owner, tail in chunks:
+        if tail and owner not in deleted:
+            pfn = ida_funcs.get_func(owner)
+            if pfn is not None and ida_funcs.remove_func_tail(pfn, chunk_start):
+                done["function tail detached"] += 1
+        elif not tail and owner < start and ida_funcs.set_func_end(owner, start):
+            done["function cut back"] += 1
+    if _merge_segments(start, end):
+        done["segments merged"] += 1
+    return done
+
+
 def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int]] | None = None) -> tuple[collections.Counter, list[str]]:
     """Apply an export_user_data() result to the open database; what the file
     holds wins over what is there. With `shift`, addresses move by the change
@@ -1986,10 +2039,7 @@ def import_user_data(data: dict, shift: bool = True, ranges: list[tuple[int, int
         ida_auto.auto_wait()
     for start, end in data.get("functions", []):
         start, end = start + delta, end + delta
-        # No function starts inside another's entry chunk in the exported database,
-        # so one here is analysis that was undone there, e.g. after a branch taken for a call.
-        while (inner := ida_funcs.get_next_func(start)) is not None and inner.start_ea < end and ida_funcs.del_func(inner.start_ea):
-            pass
+        done.update(_clear_func_bounds(start, end))
         pfn = ida_funcs.get_func(start)
         if pfn is None or pfn.start_ea != start:
             check(ida_funcs.add_func(start, end), "function", f"cannot create {hex(start)}-{hex(end)}")  # ty:ignore[too-many-positional-arguments]

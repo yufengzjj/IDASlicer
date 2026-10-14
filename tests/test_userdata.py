@@ -340,6 +340,63 @@ def test_import_removes_a_function_inside_another(db):
     assert ida_funcs.get_func(start).end_ea == end
 
 
+def _fill_bss(db):
+    start = db.ea("fill_bss")
+    return start, start + 8, ida_funcs.get_func(start).end_ea
+
+
+def test_import_cuts_back_a_function_reaching_in(db):
+    """The exported database starts a function where this one only has the middle of another."""
+    start, mid, end = _fill_bss(db)
+    try:
+        done, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "functions": [[mid, end]]})
+        assert problems == []
+        assert done["function cut back"] == 1
+        assert ida_funcs.get_func(start).end_ea == mid
+        assert (ida_funcs.get_func(mid).start_ea, ida_funcs.get_func(mid).end_ea) == (mid, end)
+    finally:
+        ida_funcs.del_func(mid)
+        ida_funcs.set_func_end(start, end)
+
+
+def test_import_detaches_a_tail_chunk_in_the_range(db):
+    start, mid, end = _fill_bss(db)
+    other = ida_funcs.get_prev_func(start).start_ea
+    assert ida_funcs.set_func_end(start, mid) and ida_funcs.append_func_tail(ida_funcs.get_func(other), mid, end)
+    try:
+        done, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "functions": [[start, end]]})
+        assert problems == []
+        assert done["function tail detached"] == 1
+        assert ida_funcs.get_func(start).end_ea == end
+        assert ida_funcs.get_func(other).tailqty == 0
+    finally:
+        ida_funcs.set_func_end(start, end)
+
+
+def test_import_merges_the_segments_a_function_spans(db):
+    start, mid, end = _fill_bss(db)
+    seg = ida_segment.getseg(start)
+    seg_start, seg_end = seg.start_ea, seg.end_ea
+    assert end < seg_end, "fill_bss must not end its segment, or the split part below has no rest past it"
+    keep = ida_segment.SEGMOD_KEEP | ida_segment.SEGMOD_SILENT
+    assert ida_segment.set_segm_end(seg_start, mid, keep) and ida_segment.add_segm(0, mid, seg_end, "split", "CODE")
+    ida_segment.set_segm_addressing(ida_segment.getseg(mid), seg.bitness)
+    try:
+        done, problems = idaslicer.import_user_data({"imagebase": ida_nalt.get_imagebase(), "functions": [[start, end]]})
+        assert problems == []
+        assert done["segments merged"] == 1
+        assert ida_segment.getseg(mid).start_ea == seg_start
+        assert ida_segment.getseg(end).start_ea == end  # the rest of the split segment stays its own
+        assert ida_funcs.get_func(start).end_ea == end
+        assert ida_bytes.is_code(ida_bytes.get_flags(mid))
+    finally:
+        rest = ida_segment.getseg(end)
+        if rest is not None and rest.start_ea != seg_start:
+            ida_segment.del_segm(rest.start_ea, keep)
+        ida_segment.set_segm_end(seg_start, seg_end, keep)
+        ida_funcs.set_func_end(start, end)
+
+
 def _json(data):
     return json.loads(json.dumps(data))
 
